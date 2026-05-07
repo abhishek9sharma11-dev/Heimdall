@@ -63,7 +63,7 @@ class Greeter:
             f"drop your questions in chat anytime."
         )
         try:
-            await self.client.send_chat(text, to=p.user_id)
+            await self.client.send_chat(text, to="everyone")
         except Exception as e:
             log.warning("greet failed for %s: %s", p.name, e)
 
@@ -122,8 +122,8 @@ class ChatHandler:
             log.exception("brain failed: %s", e)
             return
 
-        # 6. Send back via same channel
-        target = msg.sender_id if msg.is_private else "everyone"
+        # 6. Reply directly to the person who asked
+        target = msg.sender_name
         try:
             await self.client.send_chat(reply, to=target)
         except Exception as e:
