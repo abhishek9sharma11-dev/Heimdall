@@ -1,0 +1,6 @@
+.venv
+__pycache__
+bridge/build
+vector_store
+.env
+*.pyc

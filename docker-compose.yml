@@ -1,0 +1,15 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    env_file: .env
+    environment:
+      - ZOOM_BACKEND=bridge
+      - MEETING_ID=${MEETING_ID}
+      - MEETING_PASSWORD=${MEETING_PASSWORD}
+    restart: unless-stopped
+    volumes:
+      - ./knowledge:/app/knowledge
+      - ./vector_store:/app/vector_store

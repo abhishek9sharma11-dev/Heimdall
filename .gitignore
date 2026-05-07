@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+vector_store/
+
+# C++ / CMake
+bridge/build/
+bridge/zoomsdk/
+bridge/src/httplib.h     # downloaded, not vendored
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code (keep CLAUDE.md, ignore session state)
+.claude/
