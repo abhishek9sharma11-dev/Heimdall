@@ -83,8 +83,8 @@ class ChatHandler:
     def __init__(self, client: ZoomClient, slash: "SlashCommands") -> None:
         self.client = client
         self.slash = slash
-        self.brain = ClaudeClient()
-        self.rag = RAGRetriever()
+        self.brain: ClaudeClient | None = ClaudeClient() if settings.answer_questions else None
+        self.rag: RAGRetriever | None = RAGRetriever() if settings.answer_questions else None
         self._answers: Dict[str, Deque[datetime]] = defaultdict(deque)
         self._quiet = False
 
@@ -104,6 +104,12 @@ class ChatHandler:
         if self._quiet or not settings.answer_questions:
             return
 
+        # Lazily initialize LLM/RAG in case ANSWER_QUESTIONS was toggled at runtime
+        if self.brain is None:
+            self.brain = ClaudeClient()
+        if self.rag is None:
+            self.rag = RAGRetriever()
+
         # 2. DM to bot? always reply.
         # 3. Public chat? only if it looks like a question.
         if not msg.is_private and not self._looks_like_question(text):
@@ -116,6 +122,7 @@ class ChatHandler:
 
         # 5. Get RAG context, ask brain
         try:
+            assert self.rag is not None and self.brain is not None
             ctx = self.rag.retrieve(text)
             reply = await self.brain.reply(msg.sender_name, text, ctx)
         except Exception as e:
@@ -123,7 +130,10 @@ class ChatHandler:
             return
 
         # 6. Reply directly to the person who asked
-        target = msg.sender_name
+        # Use sender_id for targeting. The Playwright bridge treats `to` as a
+        # recipient key; sender_name can include extra UI text like
+        # "To Hosts and Panelists..." which breaks matching.
+        target = msg.sender_id or msg.sender_name
         try:
             await self.client.send_chat(reply, to=target)
         except Exception as e:

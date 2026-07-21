@@ -107,11 +107,11 @@ PERSONA_CONFIG = {
 
 # Free models tried in order — first one that isn't rate-limited wins
 FREE_MODEL_FALLBACKS = [
-    "google/gemma-3-27b-it:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-    "meta-llama/llama-3.2-3b-instruct:free",
-    "google/gemma-3-12b-it:free",
+    "google/gemma-4-31b-it:free",
+    "openai/gpt-oss-20b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "google/gemma-4-26b-a4b-it:free",
 ]
 
 
@@ -154,12 +154,20 @@ class ClaudeClient:
                     log.warning("used fallback model %s", model)
                 return (resp.choices[0].message.content or "").strip()
             except Exception as e:
-                if "429" in str(e) or "rate" in str(e).lower():
+                msg = str(e)
+                low = msg.lower()
+                # OpenRouter can fail a model in a few "retry with different model" ways:
+                # - 429 / rate-limited
+                # - 404 / "No endpoints found for <model>"
+                if "429" in msg or "rate" in low:
                     last_err = e
                     await asyncio.sleep(0.5)
                     continue
+                if "404" in msg or "no endpoints found" in low or "not found" in low:
+                    last_err = e
+                    continue
                 raise
-        log.error("all free models rate-limited: %s", last_err)
+        log.error("all models failed (last error): %s", last_err)
         return "sorry, I'm having trouble connecting right now. Please try again in a moment."
 
 

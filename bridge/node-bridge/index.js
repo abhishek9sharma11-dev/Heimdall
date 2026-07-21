@@ -21,6 +21,7 @@ app.use(express.json());
 let browser = null;
 let page = null;
 const sseClients = [];
+let joining = false;
 
 // ---- SSE helpers --------------------------------------------------------
 
@@ -91,15 +92,18 @@ async function injectMonitors(pg) {
     await pg.exposeFunction('__bridgeOnChat', (sender, senderId, text) => {
       if (!text || !text.trim()) return;
       const t = text.trim();
+      const cleanSender = (sender || '')
+        .replace(/\s+to\s+.*$/i, '') // "Alice To Everyone" / "Alice To Hosts and Panelists"
+        .trim();
       // Filter garbage: skip if text is just the sender name, a timestamp, or very short
-      if (t === sender.trim()) return;
+      if (cleanSender && t === cleanSender) return;
       if (/^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(t)) return;
       if (t.length < 3) return;
-      console.log(`[bridge] chat from ${sender}: ${t}`);
+      console.log(`[bridge] chat from ${cleanSender || sender}: ${t}`);
       emit({
         type: 'chat_message',
-        sender_name: sender,
-        sender_id: senderId || sender,
+        sender_name: cleanSender || sender,
+        sender_id: cleanSender || senderId || sender,
         text: t,
         is_private: false,
       });
@@ -275,6 +279,12 @@ app.post('/join', async (req, res) => {
   console.log('[bridge] starting background join for meeting', meeting_id);
 
   try {
+    if (joining) {
+      console.log('[bridge] join already in progress, ignoring new /join');
+      return;
+    }
+    joining = true;
+
     console.log('[bridge] launching Chrome...');
     browser = await chromium.launch({
       headless: false,
@@ -290,6 +300,13 @@ app.post('/join', async (req, res) => {
       permissions: ['microphone', 'camera'],
       userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    });
+
+    // Zoom sometimes opens a new tab/window and closes the initial page.
+    // Keep `page` pointing at the most recent live page.
+    context.on('page', (p) => {
+      console.log('[bridge] context opened new page');
+      page = p;
     });
 
     page = await context.newPage();
@@ -308,6 +325,11 @@ app.post('/join', async (req, res) => {
 
     // Enter display name
     try {
+      // If the page was replaced/closed by a redirect, grab the latest live page.
+      if (!page || page.isClosed()) {
+        const pages = context.pages().filter(p => !p.isClosed());
+        if (pages.length) page = pages[pages.length - 1];
+      }
       await page.waitForSelector(
         'input[placeholder*="name" i], input[placeholder*="Name" i], #inputname',
         { timeout: 15000 }
@@ -328,6 +350,11 @@ app.post('/join', async (req, res) => {
 
     // Wait for meeting to fully load
     console.log('[bridge] waiting for meeting to load...');
+    if (!page || page.isClosed()) {
+      const pages = context.pages().filter(p => !p.isClosed());
+      page = pages.length ? pages[pages.length - 1] : null;
+    }
+    if (!page) throw new Error('no active page after join navigation');
     await page.waitForTimeout(10000);
 
     // Open chat panel (best effort — tip monitor works without it)
@@ -336,12 +363,14 @@ app.post('/join', async (req, res) => {
     // Inject all monitors
     await injectMonitors(page);
 
-    page.on('close', () => emit({ type: 'meeting_ended' }));
+    // Don't emit meeting_ended on incidental redirects/tab swaps. We'll emit on /leave or join errors.
 
     console.log('[bridge] joined and monitoring chat');
   } catch (err) {
     console.error('[bridge] join error:', err.message);
     emit({ type: 'meeting_ended' });
+  } finally {
+    joining = false;
   }
 });
 
@@ -399,28 +428,50 @@ app.post('/send_chat', async (req, res) => {
 
     // Select recipient (specific person, not "everyone")
     if (to && to.toLowerCase() !== 'everyone') {
-      await selectRecipient(page, to);
+      const ok = await selectRecipient(page, to);
+      if (!ok) {
+        console.log('[bridge] falling back to everyone (recipient not found)');
+      }
     }
 
     // Type and send: use execCommand (React-friendly) then real Playwright Enter
     const focused = await page.evaluate((msg) => {
-      const ta = document.querySelector(
-        'textarea.chat-box__chat-textarea, [class*="chat-box__chat-textarea"], textarea[class*="chat"]'
-      );
-      if (ta) {
+      function setWithExecCommand(el, value) {
+        el.focus();
+        try { document.execCommand('selectAll'); } catch {}
+        try { document.execCommand('insertText', false, value); } catch {}
+      }
+
+      // Prefer a real textarea if present
+      const ta = document.querySelector('textarea.chat-box__chat-textarea, textarea[class*="chat"]');
+      if (ta && ta.tagName === 'TEXTAREA') {
         ta.focus();
-        ta.select();
-        document.execCommand('insertText', false, msg);
+        // Set value + emit input for React-driven UIs
+        ta.value = '';
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        ta.value = msg;
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
         return true;
       }
-      // Fallback: contenteditable
-      const ce = document.querySelector('[contenteditable="true"]');
-      if (ce && ce.getBoundingClientRect().width > 50) {
-        ce.focus();
-        document.execCommand('selectAll');
-        document.execCommand('insertText', false, msg);
+
+      // Some Zoom builds use a DIV with classes matching chat-box__chat-textarea.
+      const maybeInput = document.querySelector('[class*="chat-box__chat-textarea"]');
+      if (maybeInput) {
+        setWithExecCommand(maybeInput, msg);
         return true;
       }
+
+      // Fallback: any visible contenteditable
+      const ce = Array.from(document.querySelectorAll('[contenteditable="true"]'))
+        .find((el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 50 && r.height > 10;
+        });
+      if (ce) {
+        setWithExecCommand(ce, msg);
+        return true;
+      }
+
       return false;
     }, text);
 
@@ -432,9 +483,7 @@ app.post('/send_chat', async (req, res) => {
       console.log('[bridge] could not find chat input');
     }
 
-    if (!sent) {
-      throw new Error('Could not find chat input');
-    }
+    if (!focused) throw new Error('Could not find chat input');
 
     res.json({ ok: true });
   } catch (err) {

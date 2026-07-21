@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     bridge_url: str = "http://127.0.0.1:8765"
 
     # Meeting to join
+    meeting_join_url: str = ""  # optional: full Zoom join link (panelist links include tk=)
     meeting_id: str = ""
     meeting_password: str = ""
     meeting_zak: str = ""
@@ -27,7 +28,7 @@ class Settings(BaseSettings):
     # LLM — OpenRouter
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    anthropic_model: str = "google/gemma-3-27b-it:free"
+    anthropic_model: str = "meta-llama/llama-3.3-70b-instruct:free"
 
     # Identity
     bot_display_name: str = "Om Asnani AI"

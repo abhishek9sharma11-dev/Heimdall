@@ -12,6 +12,7 @@ import asyncio
 import logging
 import signal
 import sys
+from urllib.parse import parse_qs, urlparse
 
 from .config import settings
 from .handlers import ChatHandler, Greeter, MessageScheduler, SlashCommands
@@ -30,8 +31,42 @@ async def main() -> int:
     _setup_logging()
     log = logging.getLogger("main")
 
-    if not settings.openrouter_api_key:
-        print("ERROR: OPENROUTER_API_KEY not set in .env", file=sys.stderr)
+    # If a full join URL is provided, parse meeting id / pwd / panelist tk token from it.
+    # This lets you paste a single Zoom panelist link into .env as MEETING_JOIN_URL.
+    if settings.meeting_join_url:
+        try:
+            u = urlparse(settings.meeting_join_url)
+            q = parse_qs(u.query)
+            # Common Zoom params:
+            # - pwd= passcode
+            # - tk= webinar panelist token
+            # - joinConfNo= meeting/webinar id (sometimes present)
+            # Treat the join URL as source of truth when it provides fields.
+            # This avoids stale env vars overriding a fresh panelist link.
+            if q.get("pwd"):
+                settings.meeting_password = q["pwd"][0]
+            if q.get("tk"):
+                settings.meeting_webinar_token = q["tk"][0]
+
+            if q.get("joinConfNo"):
+                settings.meeting_id = q["joinConfNo"][0]
+            else:
+                # Fallback: /j/<id> or /s/<id> or /w/<id> in path
+                parts = [p for p in u.path.split("/") if p]
+                for i, part in enumerate(parts):
+                    if part in {"j", "s", "w"} and i + 1 < len(parts):
+                        cand = parts[i + 1]
+                        if cand.isdigit():
+                            settings.meeting_id = cand
+                            break
+        except Exception as e:
+            log.warning("failed to parse MEETING_JOIN_URL: %s", e)
+
+    if settings.answer_questions and not settings.openrouter_api_key:
+        print(
+            "ERROR: OPENROUTER_API_KEY not set in .env (required when ANSWER_QUESTIONS=true)",
+            file=sys.stderr,
+        )
         return 1
 
     client = make_client()
