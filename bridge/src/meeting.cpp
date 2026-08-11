@@ -1,22 +1,14 @@
 // meeting.cpp — SDK initialization, JWT-based auth, join/leave.
 //
-// IMPORTANT: signatures and headers shift between SDK versions. This file is
-// written against the v6.x Linux Meeting SDK family. If the headers in
-// zoomsdk/h/ don't match, the compiler will tell you exactly which call to
-// adjust — usually a renamed param struct or callback name.
-//
-// References (ship with the SDK):
-//   zoomsdk/demo/        — Zoom's official sample
-//   zoomsdk/h/zoom_sdk.h — InitParam / CleanUPSDK
-//   zoomsdk/h/auth_service_interface.h — IAuthService, AuthContext, IAuthServiceEvent
-//   zoomsdk/h/meeting_service_interface.h — IMeetingService, JoinParam
-//   zoomsdk/h/meeting_participants_ctrl_interface.h — onUserJoin/onUserLeft
+// Zoom Linux SDK delivers auth/meeting callbacks through a GLib main loop.
+// Pattern matches zoom/meetingsdk-headless-linux-sample.
 
 #include "meeting.h"
 #include "chat.h"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -25,18 +17,17 @@
 #include <thread>
 #include <vector>
 
-// Zoom SDK headers
+#include <glib.h>
+
 #include "zoom_sdk.h"
 #include "auth_service_interface.h"
 #include "meeting_audio_interface.h"
 #include "meeting_service_interface.h"
 #include "meeting_participants_ctrl_interface.h"
 
-// For JWT signing
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 
-// nanopb-free JSON for emitting events
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -53,23 +44,18 @@ std::mutex g_emit_mu;
 
 IAuthService*       g_auth_service    = nullptr;
 IMeetingService*    g_meeting_service = nullptr;
-IUserInfo*          g_self_info       = nullptr;
+
+GMainLoop* g_loop = nullptr;
 
 void emit_safe(const json& j) {
     std::lock_guard<std::mutex> lk(g_emit_mu);
     if (g_emit) g_emit(j);
 }
 
-// ----- Helpers ---------------------------------------------------------
-
-// Convert a wide string (zchar_t* in the SDK on Linux is usually char*)
-// to std::string. On Linux SDK builds zchar_t is typedef'd to char,
-// so this is a copy. On Windows it'd be wchar_t — adjust if porting.
 std::string z2s(const zchar_t* p) {
     return p ? std::string(p) : std::string();
 }
 
-// HMAC-SHA256 → base64url (for SDK JWT). Inlined to avoid extra deps.
 std::string base64url(const unsigned char* data, size_t len) {
     static const char tbl[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -88,27 +74,23 @@ std::string base64url(const unsigned char* data, size_t len) {
     return out;
 }
 
-// Build a Meeting SDK JWT. The SDK requires this exact set of claims.
-// Reference: developers.zoom.us/docs/meeting-sdk/auth/
 std::string build_sdk_jwt(const std::string& key, const std::string& secret) {
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    auto exp = now + 60 * 60 * 2;  // 2 hours
+    // Slightly in the past avoids clock-skew "iat in the future" failures.
+    auto iat = now - 30;
+    auto exp = iat + 60 * 60 * 2;
 
     json header = {{"alg", "HS256"}, {"typ", "JWT"}};
     json payload = {
-        {"appKey",     key},
-        {"sdkKey",     key},      // some SDK versions check sdkKey, some appKey
-        {"mn",         ""},        // meeting number — left empty here, set per-call elsewhere
-        {"role",       0},         // 0 = attendee, 1 = host
-        {"iat",        now},
-        {"exp",        exp},
-        {"tokenExp",   exp},
+        {"appKey",   key},
+        {"iat",      iat},
+        {"exp",      exp},
+        {"tokenExp", exp},
     };
 
     std::string h_str = header.dump();
     std::string p_str = payload.dump();
-
     std::string h_b64 = base64url(reinterpret_cast<const unsigned char*>(h_str.data()), h_str.size());
     std::string p_b64 = base64url(reinterpret_cast<const unsigned char*>(p_str.data()), p_str.size());
     std::string signing_input = h_b64 + "." + p_b64;
@@ -120,28 +102,118 @@ std::string build_sdk_jwt(const std::string& key, const std::string& secret) {
          reinterpret_cast<const unsigned char*>(signing_input.data()),
          signing_input.size(),
          mac, &mac_len);
-    std::string sig_b64 = base64url(mac, mac_len);
-
-    return signing_input + "." + sig_b64;
+    return signing_input + "." + base64url(mac, mac_len);
 }
 
-// ----- Auth service event handler -------------------------------------
+std::string auth_result_name(AuthResult r) {
+    switch (r) {
+        case AUTHRET_SUCCESS: return "SUCCESS";
+        case AUTHRET_KEYORSECRETEMPTY: return "KEYORSECRETEMPTY";
+        case AUTHRET_KEYORSECRETWRONG: return "KEYORSECRETWRONG";
+        case AUTHRET_ACCOUNTNOTSUPPORT: return "ACCOUNTNOTSUPPORT";
+        case AUTHRET_ACCOUNTNOTENABLESDK: return "ACCOUNTNOTENABLESDK";
+        case AUTHRET_UNKNOWN: return "UNKNOWN";
+        case AUTHRET_SERVICE_BUSY: return "SERVICE_BUSY";
+        case AUTHRET_NONE: return "NONE (no callback / timeout)";
+        case AUTHRET_OVERTIME: return "OVERTIME";
+        case AUTHRET_NETWORKISSUE: return "NETWORKISSUE";
+        case AUTHRET_CLIENT_INCOMPATIBLE: return "CLIENT_INCOMPATIBLE";
+        case AUTHRET_JWTTOKENWRONG: return "JWTTOKENWRONG";
+        case AUTHRET_LIMIT_EXCEEDED_EXCEPTION: return "LIMIT_EXCEEDED";
+        default: return "code=" + std::to_string(static_cast<int>(r));
+    }
+}
+
+struct PendingJoin {
+    JoinRequest req;
+    std::string jwt;
+    std::string err;
+    bool ok = false;
+    bool finished = false;
+    bool auth_started = false;
+    std::mutex mu;
+    std::condition_variable cv;
+};
+
+std::mutex g_join_mu;
+PendingJoin* g_pending_join = nullptr;
+
+void finish_pending(bool ok, const std::string& err) {
+    std::lock_guard<std::mutex> jlk(g_join_mu);
+    if (!g_pending_join) return;
+    {
+        std::lock_guard<std::mutex> lk(g_pending_join->mu);
+        g_pending_join->ok = ok;
+        g_pending_join->err = err;
+        g_pending_join->finished = true;
+    }
+    g_pending_join->cv.notify_all();
+    g_pending_join = nullptr;
+}
+
+bool start_meeting_join(const JoinRequest& req, std::string& err) {
+    if (!g_meeting_service) { err = "meeting service missing"; return false; }
+
+    JoinParam jp{};
+    jp.userType = SDK_UT_WITHOUT_LOGIN;
+
+    auto& wn = jp.param.withoutloginuserJoin;
+    wn.meetingNumber = std::stoull(req.meeting_id);
+    wn.userName      = req.display_name.c_str();
+    wn.psw           = req.password.empty() ? nullptr : req.password.c_str();
+    wn.vanityID      = nullptr;
+    wn.app_privilege_token = nullptr;
+    wn.userZAK       = req.zak.empty() ? nullptr : req.zak.c_str();
+    wn.customer_key  = nullptr;
+    wn.webinarToken  = req.webinar_token.empty() ? nullptr : req.webinar_token.c_str();
+    wn.isVideoOff    = true;
+    wn.isAudioOff    = true;
+    wn.join_token    = nullptr;
+    wn.onBehalfToken = nullptr;
+    wn.isMyVoiceInMix = false;
+
+    std::cerr << "[bridge] Join meetingNumber=" << req.meeting_id
+              << " webinarToken=" << (req.webinar_token.empty() ? "no" : "yes")
+              << " psw=" << (req.password.empty() ? "no" : "yes") << "\n";
+
+    SDKError jr = g_meeting_service->Join(jp);
+    if (jr != SDKERR_SUCCESS) {
+        err = "Join failed: " + std::to_string(jr);
+        return false;
+    }
+    return true;
+}
 
 class AuthListener : public IAuthServiceEvent {
 public:
-    std::atomic<AuthResult> result{AUTHRET_NONE};
-
     virtual void onAuthenticationReturn(AuthResult ret) override {
-        result.store(ret);
+        std::cerr << "[bridge] onAuthenticationReturn: " << auth_result_name(ret) << "\n";
         emit_safe({{"type", "auth_result"}, {"code", static_cast<int>(ret)}});
+
+        if (ret != AUTHRET_SUCCESS) {
+            finish_pending(false, "Auth failed: " + auth_result_name(ret));
+            return;
+        }
+
+        JoinRequest req;
+        {
+            std::lock_guard<std::mutex> jlk(g_join_mu);
+            if (!g_pending_join) return;
+            req = g_pending_join->req;
+        }
+
+        std::string err;
+        if (!start_meeting_join(req, err)) {
+            finish_pending(false, err);
+            return;
+        }
+        finish_pending(true, "");
     }
     virtual void onLoginReturnWithReason(LOGINSTATUS, IAccountInfo*, LoginFailReason) override {}
     virtual void onLogout() override {}
     virtual void onZoomIdentityExpired() override {}
     virtual void onZoomAuthIdentityExpired() override {}
 };
-
-// ----- Participants event handler -------------------------------------
 
 class ParticipantsListener : public IMeetingParticipantsCtrlEvent {
 public:
@@ -158,24 +230,22 @@ public:
                                  : (role == USERROLE_COHOST)  ? "co-host"
                                  : (role == USERROLE_PANELIST)? "panelist"
                                  : "attendee";
-            json j = {
+            emit_safe({
                 {"type", "participant_joined"},
                 {"name", z2s(u->GetUserName())},
                 {"user_id", std::to_string(uid)},
                 {"role", role_str},
-            };
-            emit_safe(j);
+            });
         }
     }
     virtual void onUserLeft(IList<unsigned int>* user_ids, const zchar_t*) override {
         if (!user_ids) return;
         for (int i = 0; i < user_ids->GetCount(); ++i) {
-            json j = {
+            emit_safe({
                 {"type", "participant_left"},
                 {"user_id", std::to_string(user_ids->GetItem(i))},
                 {"name", ""},
-            };
-            emit_safe(j);
+            });
         }
     }
     virtual void onHostChangeNotification(unsigned int) override {}
@@ -201,11 +271,11 @@ public:
     virtual void onGrantCoOwnerPrivilegeChanged(bool) override {}
 };
 
-// ----- Meeting service event handler ----------------------------------
-
 class MeetingListener : public IMeetingServiceEvent {
 public:
     virtual void onMeetingStatusChanged(MeetingStatus status, int reason) override {
+        std::cerr << "[bridge] meeting status=" << static_cast<int>(status)
+                  << " reason=" << reason << "\n";
         emit_safe({
             {"type", "meeting_status"},
             {"status", static_cast<int>(status)},
@@ -233,21 +303,48 @@ public:
     virtual void onUserNetworkStatusChanged(MeetingComponentType, ConnectionQuality, unsigned int, bool) override {}
 };
 
-// ----- Singletons -----------------------------------------------------
-
 AuthListener     g_auth_listener;
 MeetingListener  g_meeting_listener;
 
-}  // namespace
+gboolean on_pump_tick(gpointer) {
+    PendingJoin* job = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_join_mu);
+        job = g_pending_join;
+    }
+    if (!job || job->auth_started) return G_SOURCE_CONTINUE;
 
-// ============================================================
-// Public API
-// ============================================================
+    const char* key    = std::getenv("ZOOM_SDK_KEY");
+    const char* secret = std::getenv("ZOOM_SDK_SECRET");
+    if (!key || !secret || !*key || !*secret) {
+        finish_pending(false, "ZOOM_SDK_KEY/SECRET env vars not set");
+        return G_SOURCE_CONTINUE;
+    }
+    if (!g_auth_service) {
+        finish_pending(false, "auth service missing");
+        return G_SOURCE_CONTINUE;
+    }
+
+    job->jwt = build_sdk_jwt(key, secret);
+    job->auth_started = true;
+
+    std::cerr << "[bridge] SDKAuth starting (key len=" << std::strlen(key) << ")\n";
+    AuthContext ctx;
+    ctx.jwt_token = job->jwt.c_str();
+    SDKError ar = g_auth_service->SDKAuth(ctx);
+    if (ar != SDKERR_SUCCESS) {
+        finish_pending(false, "SDKAuth call failed: " + std::to_string(ar));
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+}  // namespace
 
 bool init_sdk() {
     InitParam ip;
     ip.strWebDomain    = "https://zoom.us";
-    ip.strBrandingName = "Om Asnani AI Bot";
+    ip.strSupportUrl   = "https://zoom.us";
+    ip.strBrandingName = "Heimdall AI Bot";
     ip.emLanguageID    = LANGUAGE_English;
     ip.enableLogByDefault = true;
 
@@ -290,71 +387,49 @@ void set_event_emitter(EventEmitter emit) {
 }
 
 void run_pump() {
-    // SDK v7 manages its own internal threads — no SDK_Run() call exists.
-    // This thread simply keeps the process alive while the SDK operates.
     g_pump_running = true;
-    while (g_pump_running.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    g_loop = g_main_loop_new(nullptr, FALSE);
+    g_timeout_add(50, on_pump_tick, nullptr);
+    std::cerr << "[bridge] GLib main loop running\n";
+    g_main_loop_run(g_loop);
+    g_main_loop_unref(g_loop);
+    g_loop = nullptr;
+    g_pump_running = false;
 }
 
 void stop_pump() {
     g_pump_running = false;
+    if (g_loop) g_main_loop_quit(g_loop);
 }
 
 bool join(const JoinRequest& req, std::string& err) {
     if (!g_initialized) { err = "SDK not initialized"; return false; }
-    if (!g_auth_service || !g_meeting_service) { err = "services missing"; return false; }
+    if (!g_pump_running.load()) { err = "SDK pump not running"; return false; }
 
-    // 1. Auth with SDK JWT
-    const char* key    = std::getenv("ZOOM_SDK_KEY");
-    const char* secret = std::getenv("ZOOM_SDK_SECRET");
-    if (!key || !secret) { err = "ZOOM_SDK_KEY/SECRET env vars not set"; return false; }
+    PendingJoin job;
+    job.req = req;
 
-    std::string jwt = build_sdk_jwt(key, secret);
+    {
+        std::lock_guard<std::mutex> lk(g_join_mu);
+        if (g_pending_join) {
+            err = "another join is already in progress";
+            return false;
+        }
+        g_pending_join = &job;
+    }
 
-    AuthContext ctx;
-    ctx.jwt_token = jwt.c_str();
-    SDKError ar = g_auth_service->SDKAuth(ctx);
-    if (ar != SDKERR_SUCCESS) {
-        err = "SDKAuth call failed: " + std::to_string(ar);
+    std::unique_lock<std::mutex> lk(job.mu);
+    if (!job.cv.wait_for(lk, std::chrono::seconds(90), [&]{ return job.finished; })) {
+        {
+            std::lock_guard<std::mutex> jlk(g_join_mu);
+            if (g_pending_join == &job) g_pending_join = nullptr;
+        }
+        err = "join timed out waiting for SDK auth callback";
         return false;
     }
 
-    // Wait for AuthListener to fire (with timeout)
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    while (g_auth_listener.result.load() == AUTHRET_NONE &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    if (g_auth_listener.result.load() != AUTHRET_SUCCESS) {
-        err = "Auth failed: " + std::to_string(g_auth_listener.result.load());
-        return false;
-    }
-
-    // 2. Join the meeting as a participant
-    JoinParam jp;
-    jp.userType = SDK_UT_WITHOUT_LOGIN;
-
-    // Without login: meeting number, password, display name. ZAK only needed
-    // when starting a meeting as the host.
-    auto& wn = jp.param.withoutloginuserJoin;
-    wn.meetingNumber = std::stoull(req.meeting_id);
-    wn.userName      = req.display_name.c_str();
-    wn.psw           = req.password.c_str();
-    wn.vanityID      = nullptr;
-    wn.customer_key  = nullptr;
-    wn.webinarToken  = req.webinar_token.empty() ? nullptr : req.webinar_token.c_str();
-    wn.isVideoOff    = true;
-    wn.isAudioOff    = true;
-
-    SDKError jr = g_meeting_service->Join(jp);
-    if (jr != SDKERR_SUCCESS) {
-        err = "Join failed: " + std::to_string(jr);
-        return false;
-    }
-
-    return true;
+    err = job.err;
+    return job.ok;
 }
 
 void leave() {

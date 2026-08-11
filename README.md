@@ -1,6 +1,6 @@
-# Om Asnani AI — Self-Hosted Webinar Co-host Bot
+# Heimdall — Self-Hosted Webinar Co-host Bot
 
-A self-hosted AI bot that joins your Zoom webinars as a panelist named **"Om Asnani AI"** with your photo. Auto-greets attendees, answers questions in your voice using your own content, runs scheduled messages on slash commands. No managed bot services. You own the whole stack.
+A self-hosted AI bot that joins your Zoom webinars as a panelist named **"Heimdall AI"** with your photo. Auto-greets attendees, answers questions in your voice using your own content, runs scheduled messages on slash commands. No managed bot services. You own the whole stack.
 
 ---
 
@@ -135,7 +135,7 @@ Sent in public chat by the registered HOST_EMAIL:
 ## Project structure
 
 ```
-om_asnani-ai-bot/
+heimdall/
 ├── README.md                  ← you are here
 ├── requirements.txt
 ├── .env.example
@@ -168,7 +168,7 @@ om_asnani-ai-bot/
 
 ## A note on the "AI" suffix
 
-You picked "Om Asnani AI" as the display name. Two reasons that matters:
+You picked "Heimdall AI" as the display name. Two reasons that matters:
 
 1. **Trust.** Attendees who know they're talking to an AI assistant phrase questions usefully. Attendees who *think* they're talking to you and find out otherwise lose trust in everything.
 2. **Compliance.** Zoom's AI Companion policies and several jurisdictions (EU AI Act, California's SB-1001) require disclosure when AI participates in real-time interactions in commercial contexts. The "AI" suffix + a one-line disclosure on first contact covers you.

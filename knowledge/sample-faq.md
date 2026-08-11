@@ -22,7 +22,7 @@ Think of it like two different GPS apps. Both get you to the same place but they
 
 RAG stands for Retrieval Augmented Generation. It means the AI looks up specific information from a set of documents before answering your question so the answer is more accurate and grounded in real facts.
 
-For example, this bot uses RAG to search through Om Asnani's newsletters and talks before answering your question so it gives you answers based on what Om actually said.
+For example, this bot uses RAG to search through the host's newsletters and talks before answering your question so it gives you answers based on what the host actually said.
 
 ## What does hallucination mean in AI?
 

@@ -4,12 +4,17 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
 vector_store/
 
 # C++ / CMake
 bridge/build/
 bridge/zoomsdk/
 bridge/src/httplib.h     # downloaded, not vendored
+
+# Node
+node_modules/
 
 # Editor
 .vscode/
@@ -19,3 +24,19 @@ bridge/src/httplib.h     # downloaded, not vendored
 
 # Claude Code (keep CLAUDE.md, ignore session state)
 .claude/
+
+# Live ops data — real meeting IDs, payment links, attendee/session data.
+# Never commit these; they belong to specific webinar runs, not the product.
+schedules/
+docs/daily/
+docs/DAILY-RUN-TODAY.md
+docs/SESSION-3-HANDOFF.md
+docs/TODAY-3-WEBINARS.md
+docs/TODAY-5-WEBINARS.md
+dashboard/payments.json
+dashboard/slots.json
+bridge/node-bridge/schedule.json
+sid.json
+schedule.json
+_no_schedule.json
+*.xlsx

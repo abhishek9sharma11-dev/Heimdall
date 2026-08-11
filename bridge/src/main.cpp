@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
     if (const char* p = std::getenv("BRIDGE_PORT")) port = std::atoi(p);
 
     // Init the Zoom SDK once at startup. Auth happens on /join.
+    // Keep InitSDK + join on this (main) thread; HTTP runs in the background.
     if (!Meeting::init_sdk()) {
         std::cerr << "[bridge] failed to init Zoom SDK\n";
         return 1;
@@ -90,9 +91,6 @@ int main(int argc, char** argv) {
     // Hook the SDK's events to our bus
     Meeting::set_event_emitter(&EmitEvent);
     Chat::set_event_emitter(&EmitEvent);
-
-    // Run the SDK's blocking message pump on its own thread
-    std::thread sdk_pump_thread([]() { Meeting::run_pump(); });
 
     httplib::Server svr;
 
@@ -166,14 +164,17 @@ int main(int argc, char** argv) {
     });
 
     std::cout << "[bridge] listening on " << host << ":" << port << "\n";
-    svr.listen(host, port);
+    std::thread http_thread([&]() { svr.listen(host, port); });
+
+    // SDK join/auth runs here (same thread as InitSDK).
+    Meeting::run_pump();
 
     // Shutdown
+    svr.stop();
+    if (http_thread.joinable()) http_thread.join();
     Meeting::leave();
     g_bus.stopped = true;
     g_bus.cv.notify_all();
-    Meeting::stop_pump();
-    if (sdk_pump_thread.joinable()) sdk_pump_thread.join();
     Meeting::cleanup_sdk();
     return 0;
 }

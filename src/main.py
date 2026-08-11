@@ -62,9 +62,14 @@ async def main() -> int:
         except Exception as e:
             log.warning("failed to parse MEETING_JOIN_URL: %s", e)
 
-    if settings.answer_questions and not settings.openrouter_api_key:
+    _local = any(
+        h in (settings.openrouter_base_url or "").lower()
+        for h in ("127.0.0.1", "localhost", "0.0.0.0")
+    )
+    if settings.answer_questions and not settings.openrouter_api_key and not _local:
         print(
-            "ERROR: OPENROUTER_API_KEY not set in .env (required when ANSWER_QUESTIONS=true)",
+            "ERROR: OPENROUTER_API_KEY not set (required for remote LLM). "
+            "Or set OPENROUTER_BASE_URL=http://127.0.0.1:11434/v1 for local Ollama.",
             file=sys.stderr,
         )
         return 1
@@ -109,6 +114,14 @@ async def main() -> int:
         return 2
 
     log.info("bot is live as '%s'", settings.bot_display_name)
+
+    if settings.schedule_file and str(settings.schedule_file):
+        n = scheduler.load_file(
+            settings.schedule_file,
+            settings.schedule_tz,
+            meeting_id=settings.meeting_id,
+        )
+        log.info("loaded %d scheduled message(s) from %s", n, settings.schedule_file)
 
     sched_task = asyncio.create_task(scheduler.run())
     run_task = asyncio.create_task(client.run())

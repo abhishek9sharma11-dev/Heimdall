@@ -70,7 +70,19 @@ class ZoomClient(ABC):
     async def join(self, meeting_id: str, password: str = "") -> None: ...
 
     @abstractmethod
-    async def send_chat(self, text: str, to: str = "everyone") -> None: ...
+    async def send_chat(
+        self, text: str, to: str = "everyone", *, submit: bool = True
+    ) -> None: ...
+
+    async def launch_poll(self, name: str) -> None:
+        raise NotImplementedError("launch_poll not supported on this backend")
+
+    async def end_poll(self, name: str = "") -> None:
+        raise NotImplementedError("end_poll not supported on this backend")
+
+    async def eval_js(self, code: str) -> object:
+        """Optional: evaluate JS in the live Zoom page (Playwright bridge)."""
+        return None
 
     @abstractmethod
     async def leave(self) -> None: ...
@@ -98,9 +110,21 @@ class DryRunClient(ZoomClient):
                 email=settings.host_email, role="host",
             ))
 
-    async def send_chat(self, text: str, to: str = "everyone") -> None:
+    async def send_chat(
+        self, text: str, to: str = "everyone", *, submit: bool = True
+    ) -> None:
         prefix = "[bot → all]" if to == "everyone" else f"[bot → {to}]"
-        print(f"{prefix} {text}")
+        mode = "" if submit else " [DRAFT — click Submit]"
+        print(f"{prefix}{mode} {text}")
+
+    async def launch_poll(self, name: str) -> None:
+        print(f"[dry-run] launch poll: {name}")
+
+    async def end_poll(self, name: str = "") -> None:
+        print(f"[dry-run] end poll: {name or '(current)'}")
+
+    async def eval_js(self, code: str) -> object:
+        return {"footer": 0, "attendees": 0, "participants": 0}
 
     async def leave(self) -> None:
         self._running = False
@@ -156,8 +180,24 @@ class BridgeClient(ZoomClient):
         self._cmd = httpx.AsyncClient(base_url=settings.bridge_url, timeout=60.0)
         self._sse: Optional[httpx.AsyncClient] = None
         self._stop_event = asyncio.Event()
+        self._meeting_id: str = ""
+        self._password: str = ""
+        self._reconnect_lock = asyncio.Lock()
 
-    async def join(self, meeting_id: str, password: str = "") -> None:
+    async def join(self, meeting_id: str, password: str = "", *, force: bool = False) -> None:
+        self._meeting_id = meeting_id
+        self._password = password
+        # Orchestrator restarts: keep the Playwright session if already joined.
+        if not force:
+            try:
+                h = await self._cmd.get("/health")
+                if h.status_code == 200:
+                    body = h.json()
+                    if body.get("in_meeting"):
+                        log.info("bridge already in meeting — skipping /join")
+                        return
+            except Exception:
+                pass
         payload = {
             "meeting_id": meeting_id,
             "password": password,
@@ -165,15 +205,56 @@ class BridgeClient(ZoomClient):
             "display_name": settings.bot_display_name,
             "avatar_url": settings.bot_avatar_url,
             "webinar_token": settings.meeting_webinar_token,
+            "join_url": settings.meeting_join_url,
         }
         r = await self._cmd.post("/join", json=payload)
         if r.status_code != 200:
             log.error("bridge /join error %s: %s", r.status_code, r.text)
         r.raise_for_status()
 
-    async def send_chat(self, text: str, to: str = "everyone") -> None:
-        r = await self._cmd.post("/send_chat", json={"text": text, "to": to})
+    async def reconnect(self) -> None:
+        """Ask the bridge to recover (click Join or full rejoin)."""
+        async with self._reconnect_lock:
+            try:
+                r = await self._cmd.post("/reconnect", json={})
+                r.raise_for_status()
+                log.info("requested bridge reconnect: %s", r.json())
+            except Exception as e:
+                log.warning("reconnect endpoint failed (%s) — forcing /join", e)
+                if self._meeting_id:
+                    await self.join(self._meeting_id, self._password, force=True)
+
+    async def send_chat(
+        self, text: str, to: str = "everyone", *, submit: bool = True
+    ) -> None:
+        payload = {"text": text, "to": to, "submit": submit}
+        try:
+            r = await self._cmd.post("/send_chat", json=payload)
+            r.raise_for_status()
+            return
+        except Exception as e:
+            log.warning("send_chat failed (%s) — reconnect then retry once", e)
+            await self.reconnect()
+            await asyncio.sleep(3)
+            r = await self._cmd.post("/send_chat", json=payload)
+            r.raise_for_status()
+
+    async def launch_poll(self, name: str) -> None:
+        r = await self._cmd.post("/poll/launch", json={"name": name}, timeout=60.0)
+        if r.status_code != 200:
+            log.error("poll launch failed %s: %s", r.status_code, r.text)
         r.raise_for_status()
+
+    async def end_poll(self, name: str = "") -> None:
+        r = await self._cmd.post("/poll/end", json={"name": name}, timeout=60.0)
+        if r.status_code != 200:
+            log.error("poll end failed %s: %s", r.status_code, r.text)
+        r.raise_for_status()
+
+    async def eval_js(self, code: str) -> object:
+        r = await self._cmd.post("/eval", json={"code": code}, timeout=20.0)
+        r.raise_for_status()
+        return (r.json() or {}).get("result")
 
     async def leave(self) -> None:
         try:
@@ -225,7 +306,16 @@ class BridgeClient(ZoomClient):
                 email=evt.get("email"),
                 role=evt.get("role", "attendee"),
             ))
+        elif t in {"disconnected", "reconnecting"}:
+            log.warning("bridge %s: %s", t, evt)
+            if t == "disconnected":
+                # Let the bridge watchdog recover; nudge it explicitly too.
+                asyncio.create_task(self.reconnect())
+        elif t in {"reconnected", "joined"}:
+            log.info("bridge %s: %s", t, evt)
         elif t == "meeting_ended":
+            # Explicit /leave only — do not tear down on transient drops.
+            log.info("bridge meeting_ended (explicit leave)")
             self._stop_event.set()
 
 

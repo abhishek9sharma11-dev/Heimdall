@@ -4,12 +4,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # System deps
 RUN apt-get update && apt-get install -y \
-    cmake g++ make \
+    cmake g++ make pkg-config \
     libssl-dev \
     nlohmann-json3-dev \
     python3.10 python3.10-venv python3-pip \
     curl \
     libglib2.0-0 \
+    libglib2.0-dev \
     libdbus-1-3 \
     libxcb1 \
     libxkbcommon0 \
@@ -30,6 +31,8 @@ RUN apt-get update && apt-get install -y \
     libxcb-cursor0 \
     libx11-xcb1 \
     libx11-6 \
+    libxtst6 \
+    libopengl0 \
     libgl1 \
     libgles2 \
     libgbm1 \
@@ -39,9 +42,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install Python deps first (better layer caching)
-COPY requirements.txt .
-RUN python3.10 -m pip install --no-cache-dir -r requirements.txt
+# Install Python deps first (better layer caching).
+# Lite install skips torch/sentence-transformers — enough for join + scheduled chat.
+# Use requirements.txt instead if you need RAG Q&A in the container.
+COPY requirements-lite.txt .
+RUN python3.10 -m pip install --no-cache-dir --default-timeout=100 \
+    -r requirements-lite.txt
 
 # Copy project
 COPY . .

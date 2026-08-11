@@ -23,6 +23,10 @@ endif()
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# GLib main loop — required for Zoom SDK auth/meeting callbacks on Linux
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
+
 # nlohmann/json — install on Ubuntu with: apt install nlohmann-json3-dev
 find_package(nlohmann_json 3.2.0 REQUIRED)
 
@@ -48,6 +52,7 @@ target_link_libraries(zoom-bridge PRIVATE
     OpenSSL::Crypto
     OpenSSL::SSL
     nlohmann_json::nlohmann_json
+    PkgConfig::GLIB
     dl
 )
 

@@ -77,7 +77,7 @@ The Python orchestrator drives the bridge. You don't normally call these endpoin
 ```bash
 curl -X POST http://127.0.0.1:8765/join \
   -H 'Content-Type: application/json' \
-  -d '{"meeting_id":"123456789","password":"xxx","display_name":"Om Asnani AI"}'
+  -d '{"meeting_id":"123456789","password":"xxx","display_name":"Heimdall AI"}'
 ```
 
 ## Wire protocol (commands the Python side calls)

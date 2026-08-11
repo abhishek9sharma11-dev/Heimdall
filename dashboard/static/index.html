@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <title>Hermes — Mission Control</title>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: {
+            background: "#000000",
+            surface: "#0a0a0a",
+            "surface-container": "#201f1f",
+            "surface-container-low": "#1c1b1b",
+            "surface-container-high": "#2a2a2a",
+            "surface-container-highest": "#353534",
+            "border-subtle": "#1f1f1f",
+            "text-primary": "#ffffff",
+            "text-secondary": "#a1a1aa",
+            primary: "#d2bbff",
+            "primary-container": "#7c3aed",
+            "on-primary-container": "#ede0ff",
+            secondary: "#adc6ff",
+            tertiary: "#4edea3",
+            error: "#ffb4ab",
+            "status-live": "#10b981",
+            "status-simulive": "#f59e0b",
+            "status-error": "#ef4444",
+            "on-surface-variant": "#ccc3d8",
+          },
+          fontFamily: { geist: ["Geist", "system-ui", "sans-serif"] },
+        },
+      },
+    };
+  </script>
+  <style>
+    body { background:#000; font-family:Geist,system-ui,sans-serif; -webkit-font-smoothing:antialiased; }
+    .pt-safe { padding-top: env(safe-area-inset-top, 0px); }
+    .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+    .pulse-live { animation: pulse-live 2s infinite; }
+    @keyframes pulse-live {
+      0% { box-shadow: 0 0 0 0 rgba(16,185,129,.4); }
+      70% { box-shadow: 0 0 0 8px rgba(16,185,129,0); }
+      100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+    }
+    .view { display:none; }
+    .view.active { display:block; }
+    .nav-active { color:#d2bbff !important; }
+    .chart-bar { transition: height .6s ease; }
+    input, button, select { font-family: inherit; }
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(.7); }
+    .field {
+      width:100%; background:#000; border:1px solid #1f1f1f; border-radius:.5rem;
+      color:#fff; padding:.55rem .75rem; font-size:13px; outline:none;
+    }
+    .field:focus { border-color:#7c3aed; box-shadow:0 0 0 2px rgba(124,58,237,.25); }
+    .btn-primary {
+      background:linear-gradient(135deg,#7c3aed,#6d28d9); color:#fff;
+      border-radius:.5rem; padding:.55rem 1rem; font-size:12px; font-weight:600;
+      letter-spacing:.05em; text-transform:uppercase; border:0; cursor:pointer;
+    }
+    .btn-primary:hover { transform:scale(1.02); }
+    .btn-ghost {
+      background:transparent; border:1px solid #1f1f1f; color:#a1a1aa;
+      border-radius:.5rem; padding:.55rem .9rem; font-size:12px; font-weight:600;
+      letter-spacing:.05em; text-transform:uppercase; cursor:pointer;
+    }
+    .btn-ghost:hover { color:#fff; border-color:#3f3f46; }
+    ::-webkit-scrollbar { width:6px; height:6px; }
+    ::-webkit-scrollbar-thumb { background:#2a2a2a; border-radius:999px; }
+  </style>
+</head>
+<body class="text-on-surface bg-background">
+  <header class="fixed top-0 inset-x-0 z-50 bg-background/70 backdrop-blur-xl border-b border-border-subtle pt-safe">
+    <div class="max-w-6xl mx-auto h-16 px-4 sm:px-6 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-2 min-w-[140px]">
+        <div id="sys-dot" class="w-2 h-2 rounded-full bg-status-error"></div>
+        <span id="sys-label" class="text-[12px] font-semibold tracking-[0.05em] uppercase text-status-error">Offline</span>
+      </div>
+      <div class="flex flex-col items-center">
+        <h1 class="text-[18px] sm:text-[20px] font-semibold tracking-tight">Hermes</h1>
+        <span class="text-[11px] text-text-secondary hidden sm:block">Mission Control</span>
+      </div>
+      <div class="flex items-center gap-2 min-w-[140px] justify-end">
+        <button id="btn-refresh" class="btn-ghost hidden sm:inline-flex items-center gap-1" title="Force refresh payments">
+          <span class="material-symbols-outlined text-[16px]">sync</span> Sync
+        </button>
+        <div class="w-8 h-8 rounded-full bg-primary-container flex items-center justify-center">
+          <span class="material-symbols-outlined text-on-primary-container text-[18px]">auto_awesome</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="min-h-screen pt-16 pb-24 bg-background">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6">
+      <div id="db-banner" class="hidden mt-4 rounded-xl border border-status-simulive/40 bg-status-simulive/10 px-4 py-3 text-[13px] text-status-simulive"></div>
+
+      <!-- HOME -->
+      <section id="view-home" class="view active pb-10 space-y-6">
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 pt-4">
+          <div class="bg-surface-container rounded-xl p-5 flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="material-symbols-outlined text-status-live text-[20px]">sensors</span>
+              <span id="m-live-delta" class="text-[13px] text-status-live">—</span>
+            </div>
+            <span id="m-live" class="text-[32px] font-semibold tracking-tight text-text-primary leading-10">0</span>
+            <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Live Sessions</span>
+          </div>
+          <div class="bg-surface-container rounded-xl p-5 flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="material-symbols-outlined text-primary text-[20px]">precision_manufacturing</span>
+              <span id="m-bots-status" class="text-[13px] text-primary">—</span>
+            </div>
+            <span id="m-bots" class="text-[32px] font-semibold tracking-tight text-text-primary leading-10">0</span>
+            <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Bots Connected</span>
+          </div>
+          <div class="bg-surface-container rounded-xl p-5 flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="material-symbols-outlined text-tertiary text-[20px]">payments</span>
+              <span id="m-pay-count" class="text-[13px] text-tertiary">0 pays</span>
+            </div>
+            <span id="m-revenue" class="text-[22px] sm:text-[28px] font-semibold tracking-tight text-text-primary leading-tight break-words">—</span>
+            <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Tracked Revenue</span>
+          </div>
+          <div class="bg-surface-container rounded-xl p-5 flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="material-symbols-outlined text-secondary text-[20px]">groups</span>
+              <span class="text-[13px] text-secondary">est.</span>
+            </div>
+            <span id="m-peak" class="text-[32px] font-semibold tracking-tight text-text-primary leading-10">0</span>
+            <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Peak Attendees</span>
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between">
+          <h2 class="text-[18px] font-medium text-text-primary">Zoom Sessions</h2>
+          <span id="clock-ist" class="text-[12px] font-semibold tracking-[0.05em] uppercase text-text-secondary">— IST</span>
+        </div>
+
+        <div id="account-cards" class="space-y-6"></div>
+
+        <div class="bg-surface-container rounded-xl p-5">
+          <div class="flex items-center justify-between mb-4">
+            <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Bridge Traffic</span>
+            <span class="text-[13px] text-status-live">Live View</span>
+          </div>
+          <div id="traffic-chart" class="h-24 flex items-end gap-1"></div>
+        </div>
+      </section>
+
+      <!-- SESSIONS -->
+      <section id="view-sessions" class="view pb-10 pt-4 space-y-3">
+        <h2 class="text-[18px] font-medium text-text-primary mb-2">All Sessions</h2>
+        <div id="sessions-list" class="space-y-3"></div>
+      </section>
+
+      <!-- BOTS -->
+      <section id="view-bots" class="view pb-10 pt-4 space-y-3">
+        <h2 class="text-[18px] font-medium text-text-primary mb-2">Hermes Fleet</h2>
+        <div id="bots-list" class="space-y-3"></div>
+      </section>
+
+      <!-- MORE -->
+      <section id="view-more" class="view pb-10 pt-4 space-y-4">
+        <div class="bg-surface-container rounded-xl p-5">
+          <div class="flex items-center gap-3 mb-4">
+            <div class="w-12 h-12 rounded-full bg-primary-container flex items-center justify-center">
+              <span class="material-symbols-outlined text-on-primary-container text-[24px]">auto_awesome</span>
+            </div>
+            <div>
+              <h2 class="text-[18px] font-medium text-text-primary">Hermes AI</h2>
+              <p class="text-[14px] text-text-secondary">Self-hosted Zoom co-host · live Metabase payments</p>
+            </div>
+          </div>
+          <div class="space-y-3 text-[14px]">
+            <div class="flex justify-between border-b border-border-subtle pb-2">
+              <span class="text-text-secondary">Control</span>
+              <span class="text-text-primary">http://127.0.0.1:8780</span>
+            </div>
+            <div class="flex justify-between border-b border-border-subtle pb-2">
+              <span class="text-text-secondary">Payments DB</span>
+              <span id="db-status" class="text-text-primary">—</span>
+            </div>
+            <div class="flex justify-between border-b border-border-subtle pb-2">
+              <span class="text-text-secondary">Timezone</span>
+              <span class="text-text-primary">Asia/Kolkata</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-text-secondary">Refresh</span>
+              <span class="text-text-primary">status 3s · payments ~45s cache</span>
+            </div>
+          </div>
+        </div>
+        <div class="bg-surface-container rounded-xl p-5 text-[13px] text-text-secondary leading-6 space-y-2">
+          <p class="text-text-primary font-medium">How payments work</p>
+          <p>On each session card, paste the <code class="text-primary">paymentLinkId</code> UUID and set the IST date range. Hermes queries Postgres (<code class="text-primary">DATABASE_URL</code>) for captured payments and shows live ₹ collected.</p>
+          <p>Short links like <code class="text-primary">link.outskill.com/EC-BC</code> are labels only — the filter needs the UUID from Metabase / <code>paymentLinks.id</code>.</p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <nav class="fixed bottom-0 inset-x-0 z-50 bg-surface-container/85 backdrop-blur-2xl border-t border-border-subtle pb-safe">
+    <div class="max-w-6xl mx-auto flex justify-around items-center h-16 px-2">
+      <button data-view="home" class="nav-btn nav-active flex flex-col items-center justify-center gap-1 flex-1 text-on-surface-variant transition-colors">
+        <span class="material-symbols-outlined text-[24px]">dashboard</span>
+        <span class="text-[10px] font-semibold uppercase tracking-wider">Home</span>
+      </button>
+      <button data-view="sessions" class="nav-btn flex flex-col items-center justify-center gap-1 flex-1 text-on-surface-variant transition-colors">
+        <span class="material-symbols-outlined text-[24px]">analytics</span>
+        <span class="text-[10px] font-semibold uppercase tracking-wider">Sessions</span>
+      </button>
+      <button data-view="bots" class="nav-btn flex flex-col items-center justify-center gap-1 flex-1 text-on-surface-variant transition-colors">
+        <span class="material-symbols-outlined text-[24px]">precision_manufacturing</span>
+        <span class="text-[10px] font-semibold uppercase tracking-wider">Bots</span>
+      </button>
+      <button data-view="more" class="nav-btn flex flex-col items-center justify-center gap-1 flex-1 text-on-surface-variant transition-colors">
+        <span class="material-symbols-outlined text-[24px]">menu</span>
+        <span class="text-[10px] font-semibold uppercase tracking-wider">More</span>
+      </button>
+    </div>
+  </nav>
+
+  <script>
+    const ICON_MAP = { code: "code", terminal: "terminal", school: "school", videocam: "videocam" };
+    const trafficHistory = Array(12).fill(20);
+    let lastData = null;
+
+    function esc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function statusPill(slot) {
+      const state = slot.health?.meeting_state;
+      if (state === "in_meeting") {
+        return `<div class="flex items-center gap-2 mt-1">
+          <div class="w-2 h-2 rounded-full bg-status-live pulse-live"></div>
+          <span class="text-[12px] font-semibold tracking-[0.05em] text-status-live uppercase">Live Now</span>
+        </div>`;
+      }
+      if (state === "waiting") {
+        return `<div class="flex items-center gap-2 mt-1">
+          <div class="w-2 h-2 rounded-full bg-status-live pulse-live"></div>
+          <span class="text-[12px] font-semibold tracking-[0.05em] text-status-live uppercase">Waiting Room</span>
+        </div>`;
+      }
+      if (slot.phase === "scheduled") {
+        return `<div class="flex items-center gap-2 mt-1">
+          <div class="w-2 h-2 rounded-full bg-status-simulive"></div>
+          <span class="text-[12px] font-semibold tracking-[0.05em] text-status-simulive uppercase">Scheduled</span>
+        </div>`;
+      }
+      if (slot.health?.online) {
+        return `<div class="flex items-center gap-2 mt-1">
+          <div class="w-2 h-2 rounded-full bg-primary"></div>
+          <span class="text-[12px] font-semibold tracking-[0.05em] text-primary uppercase">${esc(slot.mode || "SimuLive")}</span>
+        </div>`;
+      }
+      return `<div class="flex items-center gap-2 mt-1">
+        <div class="w-2 h-2 rounded-full bg-status-error"></div>
+        <span class="text-[12px] font-semibold tracking-[0.05em] text-status-error uppercase">Offline</span>
+      </div>`;
+    }
+
+    function revenueBlock(slot) {
+      const r = slot.revenue || {};
+      const amt = r.ok ? esc(r.total_display || "—") : "—";
+      const sub = r.ok
+        ? `${r.count} payment${r.count === 1 ? "" : "s"}`
+        : (r.pending_config ? "Set payment link" : (r.error ? "Query error" : "—"));
+      const subColor = r.ok ? "text-tertiary" : r.pending_config ? "text-text-secondary" : "text-error";
+      return { amt, sub, subColor };
+    }
+
+    function parseLinkIds(raw) {
+      return String(raw || "")
+        .split(/[\s,]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+
+    function linkRowsHtml(ids) {
+      const list = ids.length ? ids : [""];
+      return list.map((id, i) => `
+        <div class="flex items-center gap-2 link-row">
+          <input class="field flex-1" name="payment_link_id" data-link-input
+            value="${esc(id)}" placeholder="paymentLink UUID ${i + 1}" />
+          <button type="button" class="btn-ghost shrink-0 px-2" data-remove-link title="Remove"
+            ${list.length === 1 ? "disabled style=\"opacity:.35\"" : ""}>
+            <span class="material-symbols-outlined text-[18px]">close</span>
+          </button>
+        </div>`).join("");
+    }
+
+    function paymentForm(slot) {
+      const p = slot.payment || {};
+      const r = slot.revenue || {};
+      const ids = parseLinkIds(p.payment_link_ids);
+      const err = (r.error && !r.pending_config)
+        ? `<p class="text-[12px] ${r.ok && r.count === 0 ? "text-status-simulive" : "text-error"} mt-2 leading-5">${esc(r.error)}</p>` : "";
+      const recent = (r.recent || []).slice(0, 8).map((pay) => {
+        const name = pay.userFullName || pay.userEmail || "Buyer";
+        const amt = pay.amount_paid != null ? `₹${Number(pay.amount_paid).toLocaleString("en-IN")}` : "";
+        const linkShort = pay.paymentLinkId ? String(pay.paymentLinkId).slice(0, 8) : "";
+        return `<div class="flex justify-between gap-2 text-[12px] py-1 border-b border-border-subtle last:border-0">
+          <span class="text-text-primary truncate">${esc(name)}${linkShort ? ` <span class="text-text-secondary">· ${esc(linkShort)}…</span>` : ""}</span>
+          <span class="text-tertiary shrink-0">${esc(amt)}</span>
+        </div>`;
+      }).join("");
+
+      return `
+        <div class="bg-surface-container-low border-t border-border-subtle px-4 sm:px-5 py-4 space-y-3" data-pay-panel="${esc(slot.id)}">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <span class="material-symbols-outlined text-tertiary text-[18px]">payments</span>
+              <span class="text-[12px] font-semibold tracking-[0.05em] uppercase text-text-secondary">Live Payments</span>
+            </div>
+            <span class="text-[13px] ${revenueBlock(slot).subColor}">${esc(revenueBlock(slot).sub)}</span>
+          </div>
+
+          <div class="space-y-2">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">Payment link IDs (UUID)</span>
+              <button type="button" class="text-primary text-[12px] font-semibold uppercase tracking-[0.05em] flex items-center gap-1" data-add-link>
+                <span class="material-symbols-outlined text-[16px]">add_circle</span> Add link
+              </button>
+            </div>
+            <div class="space-y-2" data-link-list>
+              ${linkRowsHtml(ids)}
+            </div>
+            <p class="text-[11px] text-text-secondary">All links share one date range. Paste comma-separated UUIDs into a row to split them.</p>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <label class="block">
+              <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">Start date (IST)</span>
+              <input class="field mt-1" type="date" name="start_date" value="${esc(p.start_date || "")}" />
+            </label>
+            <label class="block">
+              <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">End date (IST)</span>
+              <input class="field mt-1" type="date" name="end_date" value="${esc(p.end_date || "")}" />
+            </label>
+            <label class="block sm:col-span-2">
+              <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">Label (optional)</span>
+              <input class="field mt-1" name="payment_link_label" value="${esc(p.payment_link_label || "")}"
+                placeholder="https://link.outskill.com/…" />
+            </label>
+          </div>
+          <div class="flex items-center gap-2">
+            <button class="btn-primary" data-save-pay="${esc(slot.id)}">Save &amp; Fetch</button>
+            <span class="text-[12px] text-text-secondary" data-save-msg="${esc(slot.id)}"></span>
+          </div>
+          ${err}
+          ${recent ? `<div class="pt-1"><p class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary mb-1">Recent</p>${recent}</div>` : ""}
+        </div>`;
+    }
+
+    function accountCard(slot) {
+      const icon = ICON_MAP[slot.icon] || "videocam";
+      const healthColor = slot.bot_health >= 100 ? "text-tertiary" : slot.bot_health > 0 ? "text-status-simulive" : "text-status-error";
+      const rev = revenueBlock(slot);
+      const href = `/session.html?id=${encodeURIComponent(slot.id)}`;
+      return `
+        <div class="bg-surface-container rounded-xl overflow-hidden border border-border-subtle hover:border-[#3f3f46] transition-colors" data-slot-card="${esc(slot.id)}">
+          <div class="p-4 sm:p-5 flex flex-col gap-3">
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0">
+                <h3 class="text-[18px] font-medium text-text-primary truncate">${esc(slot.session)}</h3>
+                <p class="text-[12px] text-text-secondary mt-0.5">${esc(slot.account)} · :${slot.port}</p>
+                ${statusPill(slot)}
+              </div>
+              <div class="bg-surface-container-high p-2 rounded-lg shrink-0">
+                <span class="material-symbols-outlined text-text-primary text-[20px]">${icon}</span>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 gap-2 py-1">
+              <div>
+                <span class="text-[10px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Attendees</span>
+                <p class="text-[16px] text-text-primary">${slot.attendees || "—"}</p>
+              </div>
+              <div>
+                <span class="text-[10px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Bot Health</span>
+                <p class="text-[16px] ${healthColor}">${slot.bot_health}%</p>
+              </div>
+              <div class="text-right">
+                <span class="text-[10px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Revenue</span>
+                <p class="text-[16px] text-text-primary">${esc(rev.amt)}</p>
+              </div>
+            </div>
+            <p class="text-[11px] text-text-secondary">${esc(slot.elapsed || "—")} · ${slot.schedule_items || 0} schedule items · ${esc(rev.sub)}</p>
+            <div class="flex flex-wrap items-center gap-2 pt-1">
+              <label class="btn-ghost inline-flex items-center gap-1 cursor-pointer !normal-case tracking-normal">
+                <span class="material-symbols-outlined text-[16px]">upload_file</span>
+                Upload sheet
+                <input type="file" class="hidden" accept=".csv,.tsv,.txt,.xlsx,.xlsm" data-schedule-upload="${esc(slot.id)}" />
+              </label>
+              <a href="/api/schedule-template.csv" class="btn-ghost inline-flex items-center gap-1" download>Template</a>
+              <a href="${href}" class="btn-primary inline-flex items-center gap-1 ml-auto">
+                Payments <span class="material-symbols-outlined text-[16px]">chevron_right</span>
+              </a>
+            </div>
+            <p class="text-[12px] text-text-secondary min-h-[1rem]" data-schedule-msg="${esc(slot.id)}"></p>
+          </div>
+        </div>`;
+    }
+
+    function sessionRow(slot) {
+      const rev = revenueBlock(slot);
+      const href = `/session.html?id=${encodeURIComponent(slot.id)}`;
+      return `
+        <a href="${href}" class="block bg-surface-container rounded-xl p-4 sm:p-5 border border-border-subtle hover:border-[#3f3f46] transition-colors">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <p class="text-[16px] text-text-primary truncate">${esc(slot.session)}</p>
+              <p class="text-[13px] text-text-secondary mt-1">${esc((slot.session_start_ist||"").slice(0,5))} – ${esc((slot.session_end_ist||"").slice(0,5))} IST · ${slot.meeting_id}</p>
+            </div>
+            <div class="text-right shrink-0">
+              <p class="text-[16px] text-text-primary">${esc(rev.amt)}</p>
+              <p class="text-[12px] ${rev.subColor}">${esc(rev.sub)}</p>
+            </div>
+          </div>
+          <div class="mt-3 flex items-center justify-between">
+            ${statusPill(slot)}
+            <span class="text-[12px] text-primary font-semibold uppercase tracking-[0.05em]">Open →</span>
+          </div>
+        </a>`;
+    }
+
+    function botRow(slot) {
+      const state = slot.health?.meeting_state || "offline";
+      const online = slot.health?.online;
+      return `
+        <div class="bg-surface-container rounded-xl p-4 flex items-center gap-3 border border-border-subtle">
+          <div class="w-10 h-10 rounded-lg bg-surface-container-high flex items-center justify-center">
+            <span class="material-symbols-outlined text-primary">${online ? "smart_toy" : "cloud_off"}</span>
+          </div>
+          <div class="flex-1 min-w-0">
+            <p class="text-[16px] text-text-primary truncate">${esc(slot.bot_name)}</p>
+            <p class="text-[13px] text-text-secondary truncate">${esc(slot.session)} · :${slot.port}</p>
+          </div>
+          <div class="text-right shrink-0">
+            <p class="text-[12px] font-semibold uppercase tracking-[0.05em] ${online ? "text-tertiary" : "text-status-error"}">${esc(state)}</p>
+            <p class="text-[11px] text-text-secondary">${slot.auto_chat ? "Q&A on" : "Q&A off"}</p>
+          </div>
+        </div>`;
+    }
+
+    function renderTraffic(slots) {
+      const load = slots.filter((s) => s.health?.online).length * 22
+        + slots.filter((s) => s.health?.in_meeting).length * 30 + 15;
+      trafficHistory.push(Math.min(100, Math.max(12, load + Math.random() * 18 - 9)));
+      trafficHistory.shift();
+      document.getElementById("traffic-chart").innerHTML = trafficHistory.map((h, i) => {
+        const intense = i === trafficHistory.length - 1 ? "bg-primary/60" : h > 60 ? "bg-primary/40" : "bg-primary/20";
+        return `<div class="flex-1 chart-bar ${intense} rounded-t-sm" style="height:${h}%"></div>`;
+      }).join("");
+    }
+
+    function collectLinkIds(panel) {
+      const vals = [...panel.querySelectorAll("[data-link-input]")]
+        .flatMap((el) => parseLinkIds(el.value));
+      // dedupe, keep order
+      return [...new Set(vals)];
+    }
+
+    function refreshLinkRemoveButtons(list) {
+      const rows = list.querySelectorAll(".link-row");
+      rows.forEach((row) => {
+        const btn = row.querySelector("[data-remove-link]");
+        if (!btn) return;
+        btn.disabled = rows.length <= 1;
+        btn.style.opacity = rows.length <= 1 ? "0.35" : "1";
+      });
+    }
+
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || "");
+          const idx = result.indexOf(",");
+          resolve(idx >= 0 ? result.slice(idx + 1) : result);
+        };
+        reader.onerror = () => reject(reader.error || new Error("read failed"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function bindScheduleUploads(root) {
+      root.querySelectorAll("[data-schedule-upload]").forEach((input) => {
+        input.addEventListener("change", async () => {
+          const slotId = input.getAttribute("data-schedule-upload");
+          const file = input.files && input.files[0];
+          const msg = root.querySelector(`[data-schedule-msg="${slotId}"]`);
+          if (!file || !slotId) return;
+          msg.textContent = `Uploading ${file.name}…`;
+          msg.className = "text-[12px] text-text-secondary min-h-[1rem]";
+          try {
+            const content_base64 = await fileToBase64(file);
+            const r = await fetch(`/api/slots/${encodeURIComponent(slotId)}/schedule`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ filename: file.name, content_base64 }),
+            });
+            const data = await r.json();
+            if (!r.ok || !data.ok) throw new Error(data.error || "Upload failed");
+            msg.textContent = `Saved ${data.item_count} timed messages → ${data.schedule_file}. Bot hot-reloads if running.`;
+            msg.className = "text-[12px] text-tertiary min-h-[1rem]";
+            await refresh(true);
+          } catch (e) {
+            msg.textContent = e.message || "Upload failed";
+            msg.className = "text-[12px] text-error min-h-[1rem]";
+          } finally {
+            input.value = "";
+          }
+        });
+      });
+    }
+
+    function bindPaymentForms(root) {
+      root.querySelectorAll("[data-pay-panel]").forEach((panel) => {
+        const list = panel.querySelector("[data-link-list]");
+        panel.querySelector("[data-add-link]")?.addEventListener("click", () => {
+          list.insertAdjacentHTML("beforeend", linkRowsHtml([""]).replace("UUID 1", `UUID ${list.children.length + 1}`));
+          // re-bind remove on new row only via delegation below
+          refreshLinkRemoveButtons(list);
+          list.querySelector(".link-row:last-child [data-link-input]")?.focus();
+        });
+
+        list.addEventListener("click", (e) => {
+          const btn = e.target.closest("[data-remove-link]");
+          if (!btn || btn.disabled) return;
+          btn.closest(".link-row")?.remove();
+          refreshLinkRemoveButtons(list);
+        });
+
+        list.addEventListener("paste", (e) => {
+          const input = e.target.closest("[data-link-input]");
+          if (!input) return;
+          const text = (e.clipboardData || window.clipboardData).getData("text");
+          const parts = parseLinkIds(text);
+          if (parts.length <= 1) return;
+          e.preventDefault();
+          input.value = parts[0];
+          const extras = parts.slice(1);
+          list.insertAdjacentHTML("beforeend", linkRowsHtml(extras));
+          refreshLinkRemoveButtons(list);
+        });
+      });
+
+      root.querySelectorAll("[data-save-pay]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const id = btn.getAttribute("data-save-pay");
+          const panel = root.querySelector(`[data-pay-panel="${id}"]`);
+          const msg = root.querySelector(`[data-save-msg="${id}"]`);
+          const links = collectLinkIds(panel);
+          const payload = {
+            payment_link_ids: links.join(","),
+            payment_link_label: panel.querySelector('[name="payment_link_label"]').value.trim(),
+            start_date: panel.querySelector('[name="start_date"]').value,
+            end_date: panel.querySelector('[name="end_date"]').value,
+            currency: "",
+          };
+          btn.disabled = true;
+          msg.textContent = "Querying DB…";
+          msg.className = "text-[12px] text-text-secondary";
+          try {
+            const r = await fetch(`/api/slots/${id}/payment`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            const data = await r.json();
+            if (!r.ok || !data.ok) throw new Error(data.error || "save failed");
+            const rev = data.revenue || {};
+            if (rev.ok && rev.count > 0) {
+              msg.textContent = `Live: ${data.total_display} · ${rev.count} pays · ${links.length} link${links.length === 1 ? "" : "s"}`;
+              msg.className = "text-[12px] text-tertiary";
+            } else if (rev.ok) {
+              msg.textContent = rev.error || "0 payments in range";
+              msg.className = "text-[12px] text-status-simulive";
+            } else {
+              msg.textContent = rev.error || "Saved";
+              msg.className = "text-[12px] text-status-simulive";
+            }
+            await refresh(true);
+          } catch (e) {
+            msg.textContent = e.message || "Error";
+            msg.className = "text-[12px] text-error";
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      });
+    }
+
+    function preserveFocus(renderFn) {
+      const active = document.activeElement;
+      const isField = active && active.classList?.contains("field");
+      const name = isField ? active.getAttribute("name") : null;
+      const panel = isField ? active.closest("[data-pay-panel]")?.getAttribute("data-pay-panel") : null;
+      const rowIdx = isField && name === "payment_link_id"
+        ? [...(active.closest("[data-link-list]")?.querySelectorAll("[data-link-input]") || [])].indexOf(active)
+        : -1;
+      const val = isField ? active.value : null;
+      const start = isField ? active.selectionStart : null;
+      const end = isField ? active.selectionEnd : null;
+      // Skip re-render while editing payment fields so multi-link rows aren't wiped mid-type
+      if (isField && panel) return;
+      renderFn();
+      if (panel && name) {
+        let el;
+        if (name === "payment_link_id" && rowIdx >= 0) {
+          el = document.querySelectorAll(`[data-pay-panel="${panel}"] [data-link-input]`)[rowIdx];
+        } else {
+          el = document.querySelector(`[data-pay-panel="${panel}"] [name="${name}"]`);
+        }
+        if (el) {
+          el.focus();
+          if (val != null && el.value !== val) el.value = val;
+          try { el.setSelectionRange(start, end); } catch {}
+        }
+      }
+    }
+
+    function render(data) {
+      lastData = data;
+      const online = data.system_online;
+      const dot = document.getElementById("sys-dot");
+      const label = document.getElementById("sys-label");
+      dot.className = `w-2 h-2 rounded-full ${online ? "bg-status-live pulse-live" : "bg-status-error"}`;
+      label.className = `text-[12px] font-semibold tracking-[0.05em] uppercase ${online ? "text-status-live" : "text-status-error"}`;
+      label.textContent = online ? "System Online" : "System Offline";
+
+      const banner = document.getElementById("db-banner");
+      const db = data.database || data.metabase || {};
+      if (!db.configured) {
+        banner.classList.remove("hidden");
+        banner.textContent = "DATABASE_URL not loaded — add it to .env and restart Hermes. You can still save payment link UUIDs + date ranges per session.";
+      } else {
+        banner.classList.add("hidden");
+      }
+      document.getElementById("db-status").textContent = db.configured
+        ? (db.label || db.url || "connected")
+        : "not configured";
+
+      document.getElementById("m-live").textContent = data.metrics.live_sessions;
+      document.getElementById("m-bots").textContent = `${data.metrics.bots_connected}/${data.metrics.bots_total}`;
+      document.getElementById("m-bots-status").textContent =
+        data.metrics.bots_connected === data.metrics.bots_total ? "Stable" :
+        data.metrics.bots_connected > 0 ? "Partial" : "Down";
+      document.getElementById("m-peak").textContent = (data.metrics.peak_attendees || 0).toLocaleString();
+      document.getElementById("m-revenue").textContent = data.metrics.todays_revenue_display ?? "—";
+      document.getElementById("m-pay-count").textContent = `${data.metrics.payment_count || 0} pays`;
+      document.getElementById("m-live-delta").textContent =
+        data.metrics.live_sessions > 0 ? "Active" : "Idle";
+      document.getElementById("clock-ist").textContent = `${data.now_ist} IST`;
+
+      const cards = document.getElementById("account-cards");
+      const byAccount = {};
+      for (const s of data.slots) {
+        const key = s.account || "Zoom";
+        (byAccount[key] ||= []).push(s);
+      }
+      const groups = Object.keys(byAccount).sort();
+      cards.innerHTML = groups.map((acct) => `
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-[13px] font-semibold tracking-[0.05em] uppercase text-text-secondary">${esc(acct)}</h3>
+            <span class="text-[11px] text-text-secondary">${byAccount[acct].length} session${byAccount[acct].length === 1 ? "" : "s"}</span>
+          </div>
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            ${byAccount[acct].map(accountCard).join("")}
+          </div>
+        </div>`).join("") || `<p class="text-text-secondary">No sessions in dashboard/slots.json</p>`;
+      bindPaymentForms(cards);
+      bindScheduleUploads(cards);
+
+      document.getElementById("sessions-list").innerHTML = data.slots.map(sessionRow).join("");
+      document.getElementById("bots-list").innerHTML = data.slots.map(botRow).join("");
+      renderTraffic(data.slots);
+    }
+
+    async function refresh(force = false) {
+      try {
+        const r = await fetch(`/api/status${force ? "?force=1" : ""}`, { cache: "no-store" });
+        if (!r.ok) throw new Error(r.statusText);
+        const data = await r.json();
+        preserveFocus(() => render(data));
+      } catch (e) {
+        document.getElementById("sys-label").textContent = "API Error";
+        console.error(e);
+      }
+    }
+
+    document.querySelectorAll(".nav-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const view = btn.dataset.view;
+        document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
+        document.getElementById(`view-${view}`).classList.add("active");
+        document.querySelectorAll(".nav-btn").forEach((b) => b.classList.remove("nav-active"));
+        btn.classList.add("nav-active");
+      });
+    });
+
+    document.getElementById("btn-refresh").addEventListener("click", () => refresh(true));
+
+    refresh(true);
+    setInterval(() => {
+      // Don't clobber an active payment form edit with a heavy re-render unless idle
+      const active = document.activeElement;
+      if (active && active.classList?.contains("field")) return;
+      refresh(false);
+    }, 3000);
+  </script>
+</body>
+</html>

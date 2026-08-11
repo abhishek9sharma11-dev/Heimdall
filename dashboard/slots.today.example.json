@@ -1,0 +1,62 @@
+[
+  {
+    "id": "slot-1",
+    "account": "Zoom Account A",
+    "account_key": "A",
+    "port": 8765,
+    "meeting_id": "TODO",
+    "env_file": ".env.TODO",
+    "schedule_file": "schedules/TODO.json",
+    "mode": "simulive",
+    "icon": "videocam",
+    "enabled": false
+  },
+  {
+    "id": "slot-2",
+    "account": "Zoom Account A",
+    "account_key": "A",
+    "port": 8766,
+    "meeting_id": "TODO",
+    "env_file": ".env.TODO",
+    "schedule_file": "schedules/TODO.json",
+    "mode": "simulive",
+    "icon": "videocam",
+    "enabled": false
+  },
+  {
+    "id": "slot-3",
+    "account": "Zoom Account A",
+    "account_key": "A",
+    "port": 8767,
+    "meeting_id": "TODO",
+    "env_file": ".env.TODO",
+    "schedule_file": "schedules/TODO.json",
+    "mode": "simulive",
+    "icon": "videocam",
+    "enabled": false
+  },
+  {
+    "id": "slot-4",
+    "account": "Zoom Account B",
+    "account_key": "B",
+    "port": 8768,
+    "meeting_id": "TODO",
+    "env_file": ".env.TODO",
+    "schedule_file": "schedules/TODO.json",
+    "mode": "simulive",
+    "icon": "videocam",
+    "enabled": false
+  },
+  {
+    "id": "slot-5",
+    "account": "Zoom Account B",
+    "account_key": "B",
+    "port": 8769,
+    "meeting_id": "TODO",
+    "env_file": ".env.TODO",
+    "schedule_file": "schedules/TODO.json",
+    "mode": "simulive",
+    "icon": "videocam",
+    "enabled": false
+  }
+]

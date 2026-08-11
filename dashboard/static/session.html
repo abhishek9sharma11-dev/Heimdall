@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Hermes — Session Payments</title>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: {
+            background: "#000000",
+            surface: "#0a0a0a",
+            "surface-container": "#201f1f",
+            "surface-container-low": "#1c1b1b",
+            "surface-container-high": "#2a2a2a",
+            "border-subtle": "#1f1f1f",
+            "text-primary": "#ffffff",
+            "text-secondary": "#a1a1aa",
+            primary: "#d2bbff",
+            "primary-container": "#7c3aed",
+            "on-primary-container": "#ede0ff",
+            tertiary: "#4edea3",
+            error: "#ffb4ab",
+            "status-live": "#10b981",
+            "status-simulive": "#f59e0b",
+            "status-error": "#ef4444",
+          },
+          fontFamily: { geist: ["Geist", "system-ui", "sans-serif"] },
+        },
+      },
+    };
+  </script>
+  <style>
+    body { background:#000; font-family:Geist,system-ui,sans-serif; -webkit-font-smoothing:antialiased; color:#e5e2e1; }
+    .field {
+      width:100%; background:#000; border:1px solid #1f1f1f; border-radius:.5rem;
+      color:#fff; padding:.55rem .75rem; font-size:13px; outline:none;
+    }
+    .field:focus { border-color:#7c3aed; box-shadow:0 0 0 2px rgba(124,58,237,.25); }
+    .btn-primary {
+      background:linear-gradient(135deg,#7c3aed,#6d28d9); color:#fff;
+      border-radius:.5rem; padding:.65rem 1.1rem; font-size:12px; font-weight:600;
+      letter-spacing:.05em; text-transform:uppercase; border:0; cursor:pointer;
+    }
+    .btn-ghost {
+      background:transparent; border:1px solid #1f1f1f; color:#a1a1aa;
+      border-radius:.5rem; padding:.55rem .9rem; font-size:12px; font-weight:600;
+      letter-spacing:.05em; text-transform:uppercase; cursor:pointer;
+    }
+    .btn-ghost:hover { color:#fff; border-color:#3f3f46; }
+    .fmt-opt {
+      flex:1; text-align:center; padding:.65rem .5rem; border:1px solid #3f3f46;
+      border-radius:.5rem; color:#a1a1aa; font-size:13px; font-weight:600; cursor:pointer;
+      background:#0a0a0a;
+    }
+    .fmt-opt.active {
+      border-color:#509ee3; color:#fff; background:rgba(80,158,227,.12);
+      box-shadow:0 0 0 1px #509ee3;
+    }
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(.7); }
+    .pay-table { border-collapse: separate; border-spacing: 0; min-width: 1400px; width: 100%; }
+    .pay-table th {
+      position: sticky; top: 0; z-index: 2;
+      background: #1c1b1b; color: #a1a1aa; font-size: 11px; font-weight: 600;
+      letter-spacing: .05em; text-transform: uppercase; text-align: left;
+      padding: 10px 12px; border-bottom: 1px solid #1f1f1f; white-space: nowrap;
+    }
+    .pay-table td {
+      padding: 10px 12px; border-bottom: 1px solid #1f1f1f;
+      font-size: 13px; color: #e5e2e1; white-space: nowrap; vertical-align: top;
+    }
+    .pay-table tr:hover td { background: #161616; }
+    .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    ::-webkit-scrollbar { height: 8px; width: 8px; }
+    ::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 999px; }
+  </style>
+</head>
+<body>
+  <header class="sticky top-0 z-50 bg-background/80 backdrop-blur-xl border-b border-border-subtle">
+    <div class="max-w-[1600px] mx-auto h-16 px-4 sm:px-6 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3 min-w-0">
+        <a href="/" class="btn-ghost inline-flex items-center gap-1 shrink-0">
+          <span class="material-symbols-outlined text-[18px]">arrow_back</span> Back
+        </a>
+        <div class="min-w-0">
+          <h1 id="session-title" class="text-[18px] font-semibold tracking-tight truncate">Session</h1>
+          <p id="session-sub" class="text-[12px] text-text-secondary truncate">Payments</p>
+        </div>
+      </div>
+      <div class="text-right shrink-0 max-w-[55%]">
+        <p id="total-amt" class="text-[18px] sm:text-[20px] font-semibold text-tertiary break-words">—</p>
+        <p id="total-count" class="text-[12px] text-text-secondary">0 payments</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-[1600px] mx-auto px-4 sm:px-6 py-6 space-y-5 pb-16">
+    <section class="bg-surface-container rounded-xl border border-border-subtle p-4 sm:p-5 space-y-4">
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-tertiary text-[20px]">payments</span>
+          <h2 class="text-[12px] font-semibold tracking-[0.05em] uppercase text-text-secondary">Live Payments Query</h2>
+        </div>
+        <span id="db-label" class="text-[11px] text-text-secondary truncate max-w-[50%]"></span>
+      </div>
+
+      <div class="space-y-2">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">Payment link IDs (UUID)</span>
+          <button type="button" id="btn-add-link" class="text-primary text-[12px] font-semibold uppercase tracking-[0.05em] inline-flex items-center gap-1">
+            <span class="material-symbols-outlined text-[16px]">add_circle</span> Add link
+          </button>
+        </div>
+        <div id="link-list" class="space-y-2"></div>
+        <p class="text-[11px] text-text-secondary">Paste multiple UUIDs (comma-separated) into any row to split them. Same date range applies to all.</p>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <label class="block">
+          <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">Start date (IST)</span>
+          <input class="field mt-1" type="date" id="start_date" />
+        </label>
+        <label class="block">
+          <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">End date (IST)</span>
+          <input class="field mt-1" type="date" id="end_date" />
+        </label>
+        <label class="block sm:col-span-2">
+          <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-secondary">Label (optional)</span>
+          <input class="field mt-1" id="payment_link_label" placeholder="https://link.outskill.com/…" />
+        </label>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-3">
+        <button id="btn-fetch" class="btn-primary">Save &amp; Fetch</button>
+        <span id="fetch-msg" class="text-[13px] text-text-secondary"></span>
+      </div>
+      <p id="fetch-error" class="hidden text-[13px] text-status-simulive leading-5"></p>
+    </section>
+
+    <section class="bg-surface-container rounded-xl border border-border-subtle overflow-hidden">
+      <div class="px-4 sm:px-5 py-3 border-b border-border-subtle flex items-center justify-between gap-2">
+        <h2 class="text-[12px] font-semibold tracking-[0.05em] uppercase text-text-secondary">paymentlink_orders</h2>
+        <div class="flex items-center gap-3">
+          <span id="table-meta" class="text-[12px] text-text-secondary">No rows yet</span>
+          <button type="button" id="btn-download" class="btn-ghost inline-flex items-center gap-1 !normal-case tracking-normal" disabled>
+            <span class="material-symbols-outlined text-[18px]">download</span>
+            Download
+          </button>
+        </div>
+      </div>
+      <div class="overflow-auto max-h-[70vh]">
+        <table class="pay-table">
+          <thead>
+            <tr>
+              <th>paymentLinkId</th>
+              <th>gatewayPaymentId</th>
+              <th>userFullName</th>
+              <th>userEmail</th>
+              <th>userPhone</th>
+              <th>product_name</th>
+              <th>product_id</th>
+              <th>sku_id</th>
+              <th>fulfillmentType</th>
+              <th>cohort_circle_id</th>
+              <th>sale_price</th>
+              <th>amount_paid</th>
+              <th>currency</th>
+              <th>created_at_ist</th>
+              <th>updated_at_ist</th>
+            </tr>
+          </thead>
+          <tbody id="pay-tbody">
+            <tr><td colspan="15" class="text-text-secondary">Enter links + date range, then Fetch.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Download data modal (Metabase-style) -->
+  <div id="dl-modal" class="hidden fixed inset-0 z-[100] flex items-center justify-center p-4">
+    <div class="absolute inset-0 bg-black/70" data-dl-close></div>
+    <div class="relative w-full max-w-md rounded-xl border border-border-subtle bg-[#1a1b1e] shadow-2xl p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-[18px] font-semibold text-text-primary">Download data</h3>
+        <button type="button" class="text-text-secondary hover:text-white" data-dl-close>
+          <span class="material-symbols-outlined">close</span>
+        </button>
+      </div>
+      <div class="flex gap-2" id="dl-formats">
+        <button type="button" class="fmt-opt active" data-fmt="csv">.csv</button>
+        <button type="button" class="fmt-opt" data-fmt="xlsx">.xlsx</button>
+        <button type="button" class="fmt-opt" data-fmt="json">.json</button>
+      </div>
+      <label class="flex items-start gap-3 cursor-pointer">
+        <input id="dl-formatted" type="checkbox" checked class="mt-1 accent-[#509ee3] w-4 h-4" />
+        <span>
+          <span class="block text-[14px] text-text-primary font-medium">Keep the data formatted</span>
+          <span class="block text-[12px] text-text-secondary mt-0.5">E.g. September 6, 2024 or $187.50, like in Metabase</span>
+        </span>
+      </label>
+      <div class="flex justify-end pt-1">
+        <button type="button" id="dl-confirm" class="rounded-lg bg-[#509ee3] hover:bg-[#4589c8] text-white font-semibold text-[14px] px-5 py-2.5">
+          Download
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const slotId = params.get("id") || "";
+    if (!slotId) {
+      location.href = "/";
+    }
+
+    const COLS = [
+      "paymentLinkId", "gatewayPaymentId", "userFullName", "userEmail", "userPhone",
+      "product_name", "product_id", "sku_id", "fulfillmentType", "cohort_circle_id",
+      "sale_price", "amount_paid", "currency", "created_at_ist", "updated_at_ist",
+    ];
+
+    let lastPayments = [];
+    let lastSessionName = "payments";
+    let dlFormat = "csv";
+
+    function esc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function parseLinkIds(raw) {
+      return String(raw || "").split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    }
+
+    function money(amount, currency) {
+      const n = Number(amount);
+      if (!Number.isFinite(n)) return "—";
+      const cur = (currency || "").toUpperCase();
+      const formatted = n.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+      if (cur === "USD") return `$${formatted}`;
+      if (cur === "INR" || !cur) return `₹${formatted}`;
+      return `${cur} ${formatted}`;
+    }
+
+    function fmtTs(v) {
+      if (!v) return "—";
+      const s = String(v).replace("T", " ");
+      return s.length > 19 ? s.slice(0, 19) : s;
+    }
+
+    function fmtTsPretty(v) {
+      if (!v) return "";
+      const d = new Date(v);
+      if (Number.isNaN(d.getTime())) return fmtTs(v);
+      return d.toLocaleString("en-US", {
+        month: "long", day: "numeric", year: "numeric",
+        hour: "numeric", minute: "2-digit",
+      });
+    }
+
+    function rowForExport(p, formatted) {
+      const row = {};
+      for (const c of COLS) {
+        let v = p[c];
+        if (formatted) {
+          if (c === "amount_paid" || c === "sale_price") {
+            row[c] = money(v, p.currency).replace("—", "");
+            continue;
+          }
+          if (c === "created_at_ist" || c === "updated_at_ist") {
+            row[c] = fmtTsPretty(v);
+            continue;
+          }
+          if (c === "product_id" || c === "sku_id" || c === "cohort_circle_id") {
+            const n = Number(v);
+            row[c] = Number.isFinite(n) ? n.toLocaleString("en-US") : (v ?? "");
+            continue;
+          }
+        } else {
+          if (c === "amount_paid" || c === "sale_price") {
+            const n = Number(v);
+            row[c] = Number.isFinite(n) ? n : "";
+            continue;
+          }
+          if (c === "created_at_ist" || c === "updated_at_ist") {
+            row[c] = fmtTs(v).replace("—", "");
+            continue;
+          }
+        }
+        row[c] = v == null ? "" : v;
+      }
+      return row;
+    }
+
+    function downloadBlob(filename, blob) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function csvEscape(val) {
+      const s = String(val ?? "");
+      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    }
+
+    function exportPayments(fmt, formatted) {
+      const rows = lastPayments.map((p) => rowForExport(p, formatted));
+      const stamp = new Date().toISOString().slice(0, 10);
+      const base = `${(lastSessionName || "payments").replace(/[^\w\-]+/g, "_").slice(0, 40)}_paymentlink_orders_${stamp}`;
+
+      if (fmt === "json") {
+        const blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json" });
+        downloadBlob(`${base}.json`, blob);
+        return;
+      }
+
+      if (fmt === "csv") {
+        const lines = [COLS.join(",")];
+        for (const r of rows) {
+          lines.push(COLS.map((c) => csvEscape(r[c])).join(","));
+        }
+        const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+        downloadBlob(`${base}.csv`, blob);
+        return;
+      }
+
+      if (fmt === "xlsx") {
+        if (typeof XLSX === "undefined") {
+          alert("XLSX library failed to load — try CSV, or refresh the page.");
+          return;
+        }
+        const ws = XLSX.utils.json_to_sheet(rows, { header: COLS });
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "paymentlink_orders");
+        XLSX.writeFile(wb, `${base}.xlsx`);
+      }
+    }
+
+    function openDownloadModal() {
+      if (!lastPayments.length) return;
+      document.getElementById("dl-modal").classList.remove("hidden");
+    }
+
+    function closeDownloadModal() {
+      document.getElementById("dl-modal").classList.add("hidden");
+    }
+
+    function linkRow(id = "") {
+      return `<div class="flex items-center gap-2 link-row">
+        <input class="field flex-1" data-link-input value="${esc(id)}" placeholder="paymentLink UUID" />
+        <button type="button" class="btn-ghost shrink-0 px-2" data-remove-link title="Remove">
+          <span class="material-symbols-outlined text-[18px]">close</span>
+        </button>
+      </div>`;
+    }
+
+    function refreshRemoveButtons() {
+      const list = document.getElementById("link-list");
+      const rows = list.querySelectorAll(".link-row");
+      rows.forEach((row) => {
+        const btn = row.querySelector("[data-remove-link]");
+        btn.disabled = rows.length <= 1;
+        btn.style.opacity = rows.length <= 1 ? "0.35" : "1";
+      });
+    }
+
+    function setLinks(ids) {
+      const list = document.getElementById("link-list");
+      const arr = ids.length ? ids : [""];
+      list.innerHTML = arr.map(linkRow).join("");
+      refreshRemoveButtons();
+    }
+
+    function collectLinks() {
+      return [...new Set(
+        [...document.querySelectorAll("[data-link-input]")]
+          .flatMap((el) => parseLinkIds(el.value))
+      )];
+    }
+
+    function renderTable(payments) {
+      lastPayments = payments || [];
+      const btn = document.getElementById("btn-download");
+      btn.disabled = !lastPayments.length;
+      const tbody = document.getElementById("pay-tbody");
+      if (!payments.length) {
+        tbody.innerHTML = `<tr><td colspan="15" class="text-text-secondary">No captured payments for this query.</td></tr>`;
+        document.getElementById("table-meta").textContent = "0 rows";
+        return;
+      }
+      tbody.innerHTML = payments.map((p) => {
+        const cells = COLS.map((c) => {
+          let v = p[c];
+          if (c === "amount_paid" || c === "sale_price") {
+            return `<td class="mono text-tertiary">${esc(money(v, p.currency))}</td>`;
+          }
+          if (c === "created_at_ist" || c === "updated_at_ist") {
+            return `<td class="mono text-text-secondary">${esc(fmtTs(v))}</td>`;
+          }
+          if (c === "paymentLinkId" || c === "gatewayPaymentId" || c === "userEmail") {
+            return `<td class="mono" title="${esc(v)}">${esc(v ?? "—")}</td>`;
+          }
+          if (c === "product_id" || c === "sku_id" || c === "cohort_circle_id") {
+            const n = Number(v);
+            return `<td class="mono">${esc(Number.isFinite(n) ? n.toLocaleString("en-IN") : (v ?? "—"))}</td>`;
+          }
+          return `<td>${esc(v ?? "—")}</td>`;
+        }).join("");
+        return `<tr>${cells}</tr>`;
+      }).join("");
+      document.getElementById("table-meta").textContent = `${payments.length} row${payments.length === 1 ? "" : "s"}`;
+    }
+
+    function applyDetail(data) {
+      const slot = data.slot || {};
+      const pay = data.payment || {};
+      const rev = data.revenue || {};
+      lastSessionName = slot.session || slotId;
+      document.title = `Hermes — ${slot.session || slotId}`;
+      document.getElementById("session-title").textContent = slot.session || slotId;
+      document.getElementById("session-sub").textContent =
+        `${slot.account || ""} · :${slot.port || "—"} · ${slot.meeting_id || ""}`.replace(/^ · /, "");
+      document.getElementById("db-label").textContent = data.database?.label
+        ? `DB: ${data.database.label}` : "";
+      document.getElementById("start_date").value = pay.start_date || "";
+      document.getElementById("end_date").value = pay.end_date || "";
+      document.getElementById("payment_link_label").value = pay.payment_link_label || "";
+      setLinks(parseLinkIds(pay.payment_link_ids));
+      document.getElementById("total-amt").textContent = rev.ok ? (rev.total_display || "—") : "—";
+      document.getElementById("total-count").textContent = `${rev.count || 0} payments`;
+      const err = document.getElementById("fetch-error");
+      if (rev.error) {
+        err.textContent = rev.error;
+        err.classList.remove("hidden");
+      } else {
+        err.classList.add("hidden");
+      }
+      renderTable(rev.payments || []);
+    }
+
+    async function loadDetail() {
+      const r = await fetch(`/api/slots/${encodeURIComponent(slotId)}?force=1`, { cache: "no-store" });
+      const data = await r.json();
+      if (!r.ok || !data.ok) throw new Error(data.error || "Failed to load session");
+      applyDetail(data);
+      return data;
+    }
+
+    document.getElementById("btn-add-link").addEventListener("click", () => {
+      document.getElementById("link-list").insertAdjacentHTML("beforeend", linkRow(""));
+      refreshRemoveButtons();
+      document.querySelector("#link-list .link-row:last-child [data-link-input]")?.focus();
+    });
+
+    document.getElementById("link-list").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-remove-link]");
+      if (!btn || btn.disabled) return;
+      btn.closest(".link-row")?.remove();
+      refreshRemoveButtons();
+    });
+
+    document.getElementById("link-list").addEventListener("paste", (e) => {
+      const input = e.target.closest("[data-link-input]");
+      if (!input) return;
+      const text = (e.clipboardData || window.clipboardData).getData("text");
+      const parts = parseLinkIds(text);
+      if (parts.length <= 1) return;
+      e.preventDefault();
+      input.value = parts[0];
+      document.getElementById("link-list").insertAdjacentHTML("beforeend", parts.slice(1).map(linkRow).join(""));
+      refreshRemoveButtons();
+    });
+
+    document.getElementById("btn-fetch").addEventListener("click", async () => {
+      const btn = document.getElementById("btn-fetch");
+      const msg = document.getElementById("fetch-msg");
+      const links = collectLinks();
+      const payload = {
+        payment_link_ids: links.join(","),
+        payment_link_label: document.getElementById("payment_link_label").value.trim(),
+        start_date: document.getElementById("start_date").value,
+        end_date: document.getElementById("end_date").value,
+        currency: "",
+      };
+      btn.disabled = true;
+      msg.textContent = "Querying DB…";
+      msg.className = "text-[13px] text-text-secondary";
+      try {
+        const r = await fetch(`/api/slots/${encodeURIComponent(slotId)}/payment`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await r.json();
+        if (!r.ok || !data.ok) throw new Error(data.error || "Fetch failed");
+        // Reload full detail so table columns stay complete
+        await loadDetail();
+        const rev = data.revenue || {};
+        msg.textContent = rev.ok
+          ? `Fetched ${rev.count || 0} payments · ${data.total_display || rev.total_display || "—"}`
+          : (rev.error || "Done");
+        msg.className = rev.ok && rev.count > 0
+          ? "text-[13px] text-tertiary"
+          : "text-[13px] text-status-simulive";
+      } catch (e) {
+        msg.textContent = e.message || "Error";
+        msg.className = "text-[13px] text-error";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("btn-download").addEventListener("click", openDownloadModal);
+    document.querySelectorAll("[data-dl-close]").forEach((el) => {
+      el.addEventListener("click", closeDownloadModal);
+    });
+    document.getElementById("dl-formats").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-fmt]");
+      if (!btn) return;
+      dlFormat = btn.getAttribute("data-fmt");
+      document.querySelectorAll("#dl-formats .fmt-opt").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+    });
+    document.getElementById("dl-confirm").addEventListener("click", () => {
+      const formatted = document.getElementById("dl-formatted").checked;
+      exportPayments(dlFormat, formatted);
+      closeDownloadModal();
+    });
+
+    loadDetail().catch((e) => {
+      document.getElementById("fetch-error").textContent = e.message || "Load failed";
+      document.getElementById("fetch-error").classList.remove("hidden");
+    });
+  </script>
+</body>
+</html>

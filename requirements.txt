@@ -17,3 +17,7 @@ apscheduler>=3.10
 
 # Logging
 structlog>=24.0
+
+# Hermes dashboard — live payments + schedule sheet upload
+psycopg[binary]>=3.1
+openpyxl>=3.1

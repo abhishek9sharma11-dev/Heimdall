@@ -83,7 +83,7 @@ Now reply to this attendee message. Plain text only. 2 lines plus 1 example line
 # ============================================================
 
 PERSONA_CONFIG = {
-    "host_name": "Om Asnani",
+    "host_name": "the host",
     "topics_yes": (
         "AI tools and how to use them in everyday work. "
         "Building newsletters and audiences. "
@@ -115,14 +115,25 @@ FREE_MODEL_FALLBACKS = [
 ]
 
 
+def _is_local_llm(base_url: str) -> bool:
+    u = (base_url or "").lower()
+    return any(h in u for h in ("127.0.0.1", "localhost", "0.0.0.0"))
+
+
 class ClaudeClient:
     def __init__(self) -> None:
+        # Ollama / LM Studio accept any non-empty key; OpenRouter needs a real one.
+        api_key = settings.openrouter_api_key or (
+            "ollama" if _is_local_llm(settings.openrouter_base_url) else ""
+        )
         self.client = AsyncOpenAI(
-            api_key=settings.openrouter_api_key,
+            api_key=api_key,
             base_url=settings.openrouter_base_url,
         )
-        # Primary model from config; fallbacks kick in on 429
         self.primary = settings.anthropic_model
+        self.local = _is_local_llm(settings.openrouter_base_url)
+        if self.local:
+            log.info("LLM local endpoint %s model=%s", settings.openrouter_base_url, self.primary)
 
     async def reply(
         self,
@@ -141,7 +152,11 @@ class ClaudeClient:
             question=question,
         )
 
-        models = [self.primary] + [m for m in FREE_MODEL_FALLBACKS if m != self.primary]
+        # Local Ollama: only try the configured model (OpenRouter free fallbacks don't apply).
+        if self.local:
+            models = [self.primary]
+        else:
+            models = [self.primary] + [m for m in FREE_MODEL_FALLBACKS if m != self.primary]
         last_err: Exception = RuntimeError("no models available")
         for model in models:
             try:

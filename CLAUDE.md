@@ -1,10 +1,10 @@
-# CLAUDE.md — Om Asnani AI Webinar Bot
+# CLAUDE.md — Heimdall Webinar Bot
 
 This file is read at the start of every Claude Code session. Keep it factual and current.
 
 ## What this project is
 
-A self-hosted AI bot that joins Zoom webinars as a panelist named "Om Asnani AI" with the host's photo. Auto-greets attendees, answers questions in the host's voice using a local RAG knowledge base, and accepts host slash commands for scheduled messages.
+A self-hosted AI bot that joins Zoom webinars as a panelist named "Heimdall AI" with the host's photo. Auto-greets attendees, answers questions in the host's voice using a local RAG knowledge base, and accepts host slash commands for scheduled messages.
 
 **Hard constraint: self-hosted, no managed bot services.** No Recall.ai, no MeetStream, no third-party APIs except Anthropic for the LLM. The reason this constraint exists: cost control + data ownership.
 
@@ -162,7 +162,7 @@ For knowledge base growth:
 
 ## Non-negotiables
 
-- The bot's display name MUST contain "AI" or "Assistant" — `src/config.py` defaults to "Om Asnani AI". Don't remove the suffix.
+- The bot's display name MUST contain "AI" or "Assistant" — `src/config.py` defaults to "Heimdall AI". Don't remove the suffix.
 - The disclosure line fires on first contact with each attendee in `src/handlers.py::Greeter`. Don't disable.
 - The `HOST_EMAIL` check in `src/handlers.py::ChatHandler._is_host` must remain — it's the only thing keeping random attendees from running slash commands.
 - When the LLM doesn't have grounded RAG context for a factual question, the persona must say so and offer to flag for the human host. Don't let it confabulate.
