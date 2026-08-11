@@ -6,6 +6,7 @@ venv/
 .env
 .env.*
 !.env.example
+env-backups/
 vector_store/
 
 # C++ / CMake
