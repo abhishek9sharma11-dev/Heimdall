@@ -848,13 +848,13 @@ async function doJoin(params, { force = false } = {}) {
     try {
       browser = await chromium.launch({
         channel: 'chrome',
-        headless: false,
+        headless: HEADLESS,
         args: launchArgs,
       });
     } catch (e) {
       console.log('[bridge] system Chrome unavailable, using Playwright Chromium:', e.message);
       browser = await chromium.launch({
-        headless: false,
+        headless: HEADLESS,
         args: launchArgs,
       });
     }
@@ -1547,6 +1547,7 @@ app.post('/eval', async (req, res) => {
 // ---- Start --------------------------------------------------------------
 
 const PORT = parseInt(process.env.BRIDGE_PORT || '8765');
+const HEADLESS = process.env.HERMES_WORKER_MODE === '1' || process.env.ZOOM_HEADLESS === '1';
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`[node-bridge] listening on 127.0.0.1:${PORT}`);
 });
