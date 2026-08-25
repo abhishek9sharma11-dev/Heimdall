@@ -11,6 +11,11 @@ from dashboard import server
 
 
 class WorkerSlotsRegressionTests(unittest.TestCase):
+    def test_time_value_normalizes_minutes_to_seconds(self) -> None:
+        self.assertEqual(server._time_value("19:20"), "19:20:00")
+        self.assertEqual(server._time_value("22:12"), "22:12:00")
+        self.assertEqual(server._time_value("19:20:35"), "19:20:35")
+
     def test_worker_missing_slots_returns_empty_and_status_is_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "slots.json"

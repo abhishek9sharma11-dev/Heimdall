@@ -107,7 +107,12 @@ def _time_value(value: str) -> str:
     if "T" in value:
         value = value.split("T", 1)[1]
     value = value.split("+", 1)[0].split("Z", 1)[0]
-    return value[:8] if value else ""
+    if not value:
+        return ""
+    parts = value.split(":")
+    if len(parts) == 2:
+        return f"{parts[0]}:{parts[1]}:00"
+    return value[:8]
 
 
 def _load_dotenv() -> None:
