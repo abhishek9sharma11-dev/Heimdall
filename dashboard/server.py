@@ -9,19 +9,27 @@ Usage:
 from __future__ import annotations
 
 import json
+import csv
+import io
 import os
 import re
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+import urllib.parse
 from zoneinfo import ZoneInfo
 
 from . import payments_db
 from .payments_db import format_totals_by_currency
 from .schedule_upload import parse_upload, write_schedule
+import subprocess
+import shlex
+import base64
+import urllib.request
+import sys
 
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
@@ -32,11 +40,38 @@ COHORTS_PATH = ROOT / "cohorts.json"
 PEAK_PATH = Path("/tmp/hermes-peak-attendees.json")
 PAY_DROP_PATH = Path("/tmp/hermes-payment-drop-attendees.json")
 TZ = ZoneInfo("Asia/Kolkata")
-HOST = "127.0.0.1"
+HOST = os.environ.get("HERMES_HOST") or "127.0.0.1"
 PORT = int(os.environ.get("HERMES_PORT") or "8780")
 
 _payments_lock = threading.Lock()
 _cohorts_lock = threading.Lock()
+_bot_procs_lock = threading.Lock()
+# mapping: session_key -> info dict for either subprocess or docker-launched session
+_bot_procs: dict[str, dict[str, Any]] = {}
+_PLAYWRIGHT_PORTS = tuple(range(8765, 8778))
+_zoom_registration_cache: dict[str, tuple[float, int | None, str | None]] = {}
+_ZOOM_REGISTRATION_CACHE_SEC = 300
+_TRACKER_EVAL = r'''var t=(document.body&&document.body.innerText)||'';var a=null;var m=t.match(/Attendees\s*\((\d+)\)/i);if(m)a=parseInt(m[1],10);var p=t.match(/Participants\s*\((\d+)\)/i);return {attendees:a,participants:p?parseInt(p[1],10):null};'''
+
+
+def _pick_playwright_port() -> int:
+    """Pick an unused local port for a visible Playwright bridge."""
+    import urllib.error
+    import urllib.request
+
+    used = {
+        int(entry.get('bridge_port'))
+        for entry in _bot_procs.values()
+        if entry.get('bridge_port')
+    }
+    for port in _PLAYWRIGHT_PORTS:
+        if port in used:
+            continue
+        try:
+            urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=0.25)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return port
+    raise RuntimeError('no free Playwright bridge port (8765-8775)')
 
 
 def _load_dotenv() -> None:
@@ -64,6 +99,34 @@ def _load_slots() -> list[dict[str, Any]]:
         if not mid or mid.upper() == "TODO":
             continue
         out.append(s)
+
+    # A newly uploaded session schedule is useful dashboard state even before
+    # someone adds a permanent slot definition for it. Discover those files so
+    # scheduled workshops are visible immediately.
+    known_ids = {str(s.get("meeting_id") or "") for s in out}
+    schedule_dir = REPO / "schedules"
+    if schedule_dir.exists():
+        for path in sorted(schedule_dir.glob("*.json")):
+            try:
+                sched = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            mid = str(sched.get("meeting_id") or "")
+            if not mid or mid in known_ids or not sched.get("session_start_ist"):
+                continue
+            out.append({
+                "id": re.sub(r"[^A-Za-z0-9_-]+", "-", mid).strip("-").lower() or "scheduled-session",
+                "account": "Scheduled",
+                "account_key": "scheduled",
+                "port": 0,
+                "meeting_id": mid,
+                "env_file": "__scheduled__.env",
+                "schedule_file": str(path.relative_to(REPO)),
+                "mode": "simulive",
+                "icon": "videocam",
+                "enabled": True,
+            })
+            known_ids.add(mid)
     return out
 
 
@@ -277,6 +340,30 @@ def _load_schedule(rel: str) -> dict[str, Any]:
         return {}
 
 
+def _effective_schedule(
+    slot: dict[str, Any], sched: dict[str, Any], now: datetime | None = None
+) -> dict[str, Any]:
+    """Use slot timing as the dashboard fallback before a schedule is uploaded."""
+    if sched.get("session_start_ist") or not slot.get("session_start_ist"):
+        return sched
+    # A bare slot start is only enough to show a future scheduled card. Once
+    # that time has passed, do not pretend an old slot is still live without a
+    # real schedule/end time.
+    if now is not None:
+        try:
+            sh, sm, ss = [int(x) for x in str(slot["session_start_ist"]).split(":")]
+            start = now.replace(hour=sh, minute=sm, second=ss, microsecond=0)
+            if now >= start:
+                return sched
+        except (ValueError, AttributeError):
+            return sched
+    merged = dict(sched)
+    merged["session_start_ist"] = slot["session_start_ist"]
+    if slot.get("session_end_ist") and not merged.get("session_end_ist"):
+        merged["session_end_ist"] = slot["session_end_ist"]
+    return merged
+
+
 def _bridge_health(port: int) -> dict[str, Any]:
     import urllib.error
     import urllib.request
@@ -320,7 +407,7 @@ def _session_phase(sched: dict[str, Any], now: datetime) -> str:
 
     if now < start_t:
         return "scheduled"
-    if end_t and now > end_t:
+    if end_t and now >= end_t:
         return "ended"
     return "live"
 
@@ -382,6 +469,161 @@ def _slot_revenue(slot_id: str, pay_cfg: dict[str, Any], *, force: bool = False)
     )
 
 
+def _zoom_registrations(meeting_id: str) -> tuple[int | None, str | None]:
+    """Return webinar registration count when Zoom Server-to-Server OAuth is configured.
+
+    Meeting SDK credentials and the panelist link cannot read registrants. The optional
+    OAuth credentials are deliberately required so the dashboard never reports a guess.
+    """
+    override = os.environ.get(f"ZOOM_REGISTRATIONS_{meeting_id}")
+    if override and override.isdigit():
+        return int(override), "env_override"
+    account = os.environ.get("ZOOM_OAUTH_ACCOUNT_ID")
+    client = os.environ.get("ZOOM_OAUTH_CLIENT_ID")
+    secret = os.environ.get("ZOOM_OAUTH_CLIENT_SECRET")
+    if not (account and client and secret):
+        return None, "Configure ZOOM_OAUTH_ACCOUNT_ID, ZOOM_OAUTH_CLIENT_ID and ZOOM_OAUTH_CLIENT_SECRET"
+    import time
+    cached = _zoom_registration_cache.get(meeting_id)
+    if cached and time.time() - cached[0] < _ZOOM_REGISTRATION_CACHE_SEC:
+        return cached[1], cached[2]
+    try:
+        token_req = urllib.request.Request(
+            "https://zoom.us/oauth/token?grant_type=account_credentials&account_id=" + urllib.parse.quote(account),
+            method="POST",
+            headers={"Authorization": "Basic " + base64.b64encode(f"{client}:{secret}".encode()).decode()},
+        )
+        with urllib.request.urlopen(token_req, timeout=10) as resp:
+            token = json.loads(resp.read().decode())["access_token"]
+        total = 0
+        next_token = ""
+        while True:
+            url = f"https://api.zoom.us/v2/webinars/{urllib.parse.quote(meeting_id)}/registrants?page_size=300"
+            if next_token:
+                url += "&next_page_token=" + urllib.parse.quote(next_token)
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            total += len(data.get("registrants") or [])
+            next_token = data.get("next_page_token") or ""
+            if not next_token:
+                break
+        result = (total, None)
+    except Exception as exc:  # best-effort dashboard metric
+        result = (None, f"Zoom registrations unavailable: {exc}")
+    _zoom_registration_cache[meeting_id] = (time.time(), result[0], result[1])
+    return result
+
+
+def _report_for_slot(slot: dict[str, Any], sched: dict[str, Any], metrics: dict[str, Any], revenue: dict[str, Any]) -> dict[str, Any]:
+    payments = revenue.get("payments") or []
+    currency_counts: dict[str, int] = {}
+    for payment in payments:
+        code = str(payment.get("currency") or "").upper()
+        if code:
+            currency_counts[code] = currency_counts.get(code, 0) + 1
+    registrations, registration_error = _zoom_registrations(str(slot["meeting_id"]))
+    return {
+        "date": datetime.now(TZ).strftime("%Y-%m-%d"),
+        "workshop": sched.get("session") or slot["id"],
+        "peak_showup": metrics.get("peak_attendees"),
+        "retention": metrics.get("retention"),
+        "inr": currency_counts.get("INR") if revenue.get("ok") else None,
+        "usd": currency_counts.get("USD") if revenue.get("ok") else None,
+        "total_payments": int(revenue.get("count") or 0) if revenue.get("ok") else None,
+        "zoom_registrations": registrations,
+        "zoom_registrations_error": registration_error,
+    }
+
+
+def _tracker_counts(port: int) -> dict[str, Any]:
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/eval",
+            data=json.dumps({"code": _TRACKER_EVAL}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode()).get("result") or {}
+    except Exception:
+        return {}
+
+
+def _metrics_tracker_loop() -> None:
+    """Continuously collect first-hour peak and payment-drop retention for dashboard slots."""
+    import time
+    while True:
+        try:
+            now = datetime.now(TZ)
+            day = now.strftime("%Y-%m-%d")
+            peak_data = json.loads(PEAK_PATH.read_text()) if PEAK_PATH.exists() else {"slots": {}}
+            peak_data.setdefault("slots", {})
+            drop_data = json.loads(PAY_DROP_PATH.read_text()) if PAY_DROP_PATH.exists() else {"sessions": {}}
+            drop_data.setdefault("sessions", {})
+            changed_peak = changed_drop = False
+            for slot in _load_slots():
+                sched = _load_schedule(slot.get("schedule_file", ""))
+                start = sched.get("session_start_ist")
+                health = _bridge_health(int(slot["port"]))
+                if not start and not health.get("in_meeting"):
+                    continue
+                try:
+                    if start:
+                        h, m, s = [int(x) for x in start.split(":")]
+                        start_dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
+                    else:
+                        # Ad-hoc dashboard sessions may not have a CSV yet. Start
+                        # their first-hour measurement window when first observed live.
+                        start_dt = None
+                except (ValueError, AttributeError):
+                    continue
+                counts = _tracker_counts(int(slot["port"]))
+                if not counts:
+                    continue
+                key = f"{day}:{slot['port']}:{slot['id']}"
+                item = peak_data["slots"].setdefault(key, {"id": slot["id"], "meeting_id": slot["meeting_id"], "date": day, "last": {}})
+                if start_dt is None:
+                    raw_tracker_start = item.get("tracker_started_at")
+                    try:
+                        start_dt = datetime.fromisoformat(raw_tracker_start) if raw_tracker_start else now
+                    except (TypeError, ValueError):
+                        start_dt = now
+                    if not raw_tracker_start:
+                        item["tracker_started_at"] = now.isoformat()
+                        changed_peak = True
+                item["last"] = {**counts, "at": now.isoformat()}
+                if start_dt <= now <= start_dt + timedelta(minutes=60):
+                    for field in ("attendees", "participants"):
+                        value = counts.get(field)
+                        target = f"peak_{field}"
+                        if isinstance(value, int) and value > int(item.get(target) or 0):
+                            item[target] = value
+                            item[f"{target}_at"] = now.isoformat()
+                            changed_peak = True
+                fp = next((x for x in sorted(sched.get("items") or [], key=lambda x: x.get("time", "")) if "link.outskill.com" in (x.get("text") or "")), None)
+                drop_key = f"{day}:{slot['id']}"
+                if fp and drop_key not in drop_data["sessions"]:
+                    try:
+                        dh, dm, ds = [int(x) for x in fp["time"].split(":")]
+                        drop_dt = now.replace(hour=dh, minute=dm, second=ds, microsecond=0)
+                        if abs((now - drop_dt).total_seconds()) <= 90:
+                            value = counts.get("attendees")
+                            if isinstance(value, int):
+                                drop_data["sessions"][drop_key] = {"session_id": slot["id"], "date": day, "schedule_time": fp["time"], "dropped_at": now.isoformat(), "attendees_count": value, "source": "dashboard_tracker"}
+                                changed_drop = True
+                    except (ValueError, AttributeError):
+                        pass
+            if changed_peak:
+                peak_data["updated_at"] = now.isoformat()
+                PEAK_PATH.write_text(json.dumps(peak_data, indent=2))
+            if changed_drop:
+                drop_data["updated_at"] = now.isoformat()
+                PAY_DROP_PATH.write_text(json.dumps(drop_data, indent=2) + "\n")
+        except Exception:
+            pass
+        time.sleep(10)
+
+
 def build_slot_detail(slot_id: str, *, force_payments: bool = True) -> dict[str, Any] | None:
     """Full session payload for the payments detail page."""
     now = datetime.now(TZ)
@@ -390,11 +632,13 @@ def build_slot_detail(slot_id: str, *, force_payments: bool = True) -> dict[str,
         return None
 
     env = _read_env_kv(REPO / slot_def["env_file"])
-    sched = _load_schedule(slot_def["schedule_file"])
+    sched = _effective_schedule(slot_def, _load_schedule(slot_def["schedule_file"]), now)
     health = _bridge_health(int(slot_def["port"]))
     phase = _session_phase(sched, now)
     pay_cfg = {**_default_payment_cfg(slot_id), **(_load_payments().get(slot_id) or {})}
     revenue = _slot_revenue(slot_id, pay_cfg, force=force_payments)
+    metrics = _metrics_for_slot(slot_id)
+    report = _report_for_slot(slot_def, sched, metrics, revenue)
     answer_qs = env.get("ANSWER_QUESTIONS", "true").lower() in ("1", "true", "yes")
 
     return {
@@ -418,11 +662,14 @@ def build_slot_detail(slot_id: str, *, force_payments: bool = True) -> dict[str,
             "auto_chat": answer_qs,
             "phase": phase,
             "elapsed": _elapsed_label(sched, now, phase),
-            "bot_health": 100
-            if health["online"] and not health["reconnecting"]
-            else (50 if health["online"] else 0),
+            "bot_health": 0 if phase == "ended" else (
+                100
+                if health["online"] and not health["reconnecting"]
+                else (50 if health["online"] else 0)
+            ),
             "health": health,
             "schedule_items": len(sched.get("items") or []),
+            "report": report,
         },
         "payment": pay_cfg,
         "revenue": {
@@ -470,13 +717,13 @@ def build_status(*, force_payments: bool = False) -> dict[str, Any]:
 
     for slot in _load_slots():
         env = _read_env_kv(REPO / slot["env_file"])
-        sched = _load_schedule(slot["schedule_file"])
+        sched = _effective_schedule(slot, _load_schedule(slot["schedule_file"]), now)
         health = _bridge_health(int(slot["port"]))
         phase = _session_phase(sched, now)
 
         if health["online"]:
             bots_online += 1
-        if health["in_meeting"] or phase == "live":
+        if phase != "ended" and (health["in_meeting"] or phase == "live"):
             live_count += 1
 
         attendees = 0
@@ -495,7 +742,9 @@ def build_status(*, force_payments: bool = False) -> dict[str, Any]:
         answer_qs = env.get("ANSWER_QUESTIONS", "true").lower() in ("1", "true", "yes")
 
         status_label = "offline"
-        if health["online"] and health["in_meeting"]:
+        if phase == "ended":
+            status_label = "ended"
+        elif health["online"] and health["in_meeting"]:
             status_label = "live" if phase != "ended" else "wrapping"
         elif health["online"]:
             status_label = health["meeting_state"]
@@ -504,6 +753,7 @@ def build_status(*, force_payments: bool = False) -> dict[str, Any]:
 
         pay_cfg = {**_default_payment_cfg(slot["id"]), **(payments_store.get(slot["id"]) or {})}
         revenue = _slot_revenue(slot["id"], pay_cfg, force=force_payments)
+        report = _report_for_slot(slot, sched, metrics, revenue)
         if revenue.get("ok"):
             revenue_ready = True
             revenue_count += int(revenue.get("count") or 0)
@@ -537,10 +787,14 @@ def build_status(*, force_payments: bool = False) -> dict[str, Any]:
                 "attendees": attendees,
                 "peak_attendees": metrics.get("peak_attendees"),
                 "retention": metrics.get("retention"),
+                "report": report,
+                "report_url": f"/api/slots/{slot['id']}/report.csv",
                 "cohort_id": metrics.get("cohort_id"),
-                "bot_health": 100
-                if health["online"] and not health["reconnecting"]
-                else (50 if health["online"] else 0),
+                "bot_health": 0 if phase == "ended" else (
+                    100
+                    if health["online"] and not health["reconnecting"]
+                    else (50 if health["online"] else 0)
+                ),
                 "status": status_label,
                 "health": health,
                 "schedule_items": len(sched.get("items") or []),
@@ -633,6 +887,36 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(404, {"ok": False, "error": f"unknown slot {slot_id}"})
             return self._json(200, detail)
 
+        m = re.fullmatch(r"/api/slots/([A-Za-z0-9_-]+)/report\.csv", path)
+        if m:
+            slot_id = m.group(1)
+            slot_def = next((s for s in _load_slots() if s["id"] == slot_id), None)
+            if not slot_def:
+                return self._json(404, {"ok": False, "error": f"unknown slot {slot_id}"})
+            env = _read_env_kv(REPO / slot_def["env_file"])
+            sched = _load_schedule(slot_def["schedule_file"])
+            pay_cfg = {**_default_payment_cfg(slot_id), **(_load_payments().get(slot_id) or {})}
+            revenue = _slot_revenue(slot_id, pay_cfg, force=True)
+            report = _report_for_slot(slot_def, sched, _metrics_for_slot(slot_id), revenue)
+            out = io.StringIO(newline="")
+            writer = csv.writer(out)
+            writer.writerow(["Date", "Workshop", "Peak Showup", "Retention", "INR", "USD", "Total Payments", "Zoom Registrations"])
+            writer.writerow([
+                report["date"], report["workshop"], report["peak_showup"] if report["peak_showup"] is not None else "",
+                report["retention"] if report["retention"] is not None else "", report["inr"] if report["inr"] is not None else "",
+                report["usd"] if report["usd"] is not None else "", report["total_payments"] if report["total_payments"] is not None else "",
+                report["zoom_registrations"] if report["zoom_registrations"] is not None else "",
+            ])
+            body = out.getvalue().encode()
+            filename = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{report['workshop']}-{report['date']}-report.csv")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path in ("/", "/index.html"):
             self.path = "/index.html"
             return super().do_GET()
@@ -640,6 +924,50 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/session" or path == "/session.html":
             self.path = "/session.html"
             return super().do_GET()
+
+        if path == "/connect" or path == "/connect.html":
+            self.path = "/connect.html"
+            return super().do_GET()
+
+        if path == '/api/bot/status':
+            # optional query param: ?session_key=...
+            sess = qs.get('session_key', [None])[0]
+            out = {}
+            with _bot_procs_lock:
+                if sess:
+                    entry = _bot_procs.get(sess)
+                    if not entry:
+                        out = {"ok": True, "session_key": sess, "running": False}
+                    elif entry.get('type') == 'proc':
+                        p = entry.get('proc')
+                        out = {"ok": True, "session_key": sess, "running": bool(p and p.poll() is None), "pid": getattr(p, 'pid', None)}
+                    elif entry.get('type') == 'docker':
+                        project = entry.get('project')
+                        try:
+                            r = subprocess.run(['docker', 'compose', '-p', project, 'ps'], cwd=str(REPO), capture_output=True, text=True, timeout=20)
+                            out = {"ok": True, "session_key": sess, "running": (r.returncode == 0 and 'Exit' not in r.stdout), "ps": r.stdout}
+                        except Exception as e:
+                            out = {"ok": True, "session_key": sess, "running": True, "info": f"docker ps error: {e}"}
+                    else:
+                        out = {"ok": True, "session_key": sess, "running": False}
+                else:
+                    sessions = []
+                    for k, entry in list(_bot_procs.items()):
+                        if entry.get('type') == 'proc':
+                            p = entry.get('proc')
+                            sessions.append({"session_key": k, "type": "proc", "running": bool(p and p.poll() is None), "pid": getattr(p, 'pid', None)})
+                        elif entry.get('type') == 'docker':
+                            project = entry.get('project')
+                            try:
+                                r = subprocess.run(['docker', 'compose', '-p', project, 'ps'], cwd=str(REPO), capture_output=True, text=True, timeout=20)
+                                running = (r.returncode == 0 and 'Exit' not in r.stdout)
+                                sessions.append({"session_key": k, "type": "docker", "project": project, "running": running, "ps": r.stdout})
+                            except Exception:
+                                sessions.append({"session_key": k, "type": "docker", "project": project, "running": True})
+                        else:
+                            sessions.append({"session_key": k, "type": "unknown"})
+                    out = {"ok": True, "sessions": sessions}
+            return self._json(200, out)
 
         if path == "/api/schedule-template.csv":
             body = (
@@ -724,8 +1052,6 @@ class Handler(SimpleHTTPRequestHandler):
             except json.JSONDecodeError:
                 return self._json(400, {"ok": False, "error": "invalid JSON"})
 
-            import base64
-
             filename = str(body.get("filename") or "schedule.csv")
             b64 = body.get("content_base64") or ""
             if not b64:
@@ -770,11 +1096,378 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/payments/refresh":
             return self._json(200, build_status(force_payments=True))
 
+        # Start/connect bot to Zoom with provided form data + file
+        if path in ("/api/connect", "/connect"):
+            # Support JSON (with base64-encoded file) or multipart (fallback)
+            content_type = (self.headers.get('Content-Type') or '').lower()
+            meeting_id = ''
+            meeting_join_url = ''
+            webinar_start_at = ''
+            webinar_end_at = ''
+            payment_link_ids = ''
+            schedule_items = None
+            schedule_path = None
+
+            if content_type.startswith('application/json'):
+                length = int(self.headers.get('Content-Length') or 0)
+                raw = self.rfile.read(length) if length else b''
+                try:
+                    obj = json.loads(raw.decode('utf-8') or '{}')
+                except Exception as e:
+                    return self._json(400, {"ok": False, "error": f"invalid JSON: {e}"})
+                meeting_id = str(obj.get('meeting_id') or '').strip()
+                meeting_join_url = str(obj.get('meeting_join_url') or '').strip()
+                webinar_start_at = str(obj.get('webinar_start_at') or '').strip()
+                webinar_end_at = str(obj.get('webinar_end_at') or '').strip()
+                payment_link_ids = str(obj.get('payment_link_ids') or '').strip()
+                b64 = obj.get('schedule_base64')
+                filename = obj.get('schedule_filename') or 'schedule.csv'
+                if b64:
+                    try:
+                        raw_sched = base64.b64decode(b64)
+                        schedule_items = parse_upload(filename, raw_sched)
+                    except Exception as e:
+                        return self._json(400, {"ok": False, "error": f"schedule parse failed: {e}"})
+            else:
+                # try multipart via cgi if available
+                try:
+                    fs = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={
+                        'REQUEST_METHOD': 'POST',
+                        'CONTENT_TYPE': self.headers.get('Content-Type'),
+                    })
+                except Exception:
+                    return self._json(400, {"ok": False, "error": "server missing multipart support; send JSON instead"})
+                meeting_id = (fs.getvalue('meeting_id') or '').strip()
+                meeting_join_url = (fs.getvalue('meeting_join_url') or '').strip()
+                webinar_start_at = (fs.getvalue('webinar_start_at') or '').strip()
+                webinar_end_at = (fs.getvalue('webinar_end_at') or '').strip()
+                payment_link_ids = (fs.getvalue('payment_link_ids') or '').strip()
+                schedule_field = fs['schedule_file'] if 'schedule_file' in fs else None
+                if schedule_field and getattr(schedule_field, 'file', None):
+                    raw = schedule_field.file.read()
+                    filename = getattr(schedule_field, 'filename', 'schedule.csv') or 'schedule.csv'
+                    try:
+                        schedule_items = parse_upload(filename, raw)
+                    except Exception as e:
+                        return self._json(400, {"ok": False, "error": f"schedule parse failed: {e}"})
+
+            meeting_id = re.sub(r"\s+", "", meeting_id)
+
+            if not meeting_id and not meeting_join_url:
+                return self._json(400, {"ok": False, "error": "meeting_id or meeting_join_url required"})
+
+            # choose meeting id from join URL if provided
+            if not meeting_id and meeting_join_url:
+                try:
+                    u = urlparse(meeting_join_url)
+                    q = parse_qs(u.query)
+                    if q.get('joinConfNo'):
+                        meeting_id = q['joinConfNo'][0]
+                    else:
+                        parts = [p for p in u.path.split('/') if p]
+                        for i, part in enumerate(parts):
+                            if part in {'j', 's', 'w'} and i + 1 < len(parts):
+                                cand = parts[i + 1]
+                                if cand.isdigit():
+                                    meeting_id = cand
+                                    break
+                except Exception:
+                    pass
+
+            # write schedule file if uploaded
+            schedule_path = None
+            if schedule_items:
+                sched_dir = REPO / 'schedules'
+                sched_dir.mkdir(parents=True, exist_ok=True)
+                fname = f"{meeting_id or 'session'}.json"
+                schedule_path = sched_dir / fname
+                try:
+                    write_schedule(schedule_path, meeting_id=str(meeting_id or ''), session_name=str(meeting_id or schedule_path.stem), items=schedule_items)
+                except Exception as e:
+                    return self._json(500, {"ok": False, "error": f"failed to write schedule: {e}"})
+
+            if not webinar_start_at and schedule_items:
+                first_time = schedule_items[0].get('time', '')
+                if first_time:
+                    webinar_start_at = f"{datetime.now(TZ).date().isoformat()}T{first_time}"
+            if not webinar_end_at and schedule_items:
+                last_time = schedule_items[-1].get('time', '')
+                if last_time:
+                    webinar_end_at = f"{datetime.now(TZ).date().isoformat()}T{last_time}"
+
+            # Launch bot (support Docker Compose per-session or local process)
+            session_key = meeting_id or meeting_join_url
+            if not session_key:
+                return self._json(400, {"ok": False, "error": "cannot determine session key"})
+
+            # Playwright is the safe/default production path. Docker/C++ is opt-in
+            # from the current dashboard checkbox, including for older clients that
+            # omit the field entirely.
+            use_docker = False
+            try:
+                if content_type.startswith('application/json'):
+                    use_docker = bool(obj.get('use_docker', False))
+            except Exception:
+                use_docker = False
+
+            safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", session_key)[:40]
+
+            with _bot_procs_lock:
+                existing = _bot_procs.get(session_key)
+                if existing and existing.get('type') == 'proc' and existing.get('proc') and existing['proc'].poll() is None:
+                    return self._json(409, {"ok": False, "error": "session already running (proc)", "session_key": session_key})
+                if existing and existing.get('type') == 'docker' and existing.get('project'):
+                    return self._json(409, {"ok": False, "error": "session already running (docker)", "session_key": session_key})
+
+                if use_docker:
+                    # write env file for this session — seed from the repo's base .env
+                    # so Zoom SDK / LLM credentials carry over, then apply overrides
+                    base_env = _read_env_kv(REPO / ".env")
+                    env_filename = f".env.{safe_key}"
+                    env_path = REPO / env_filename
+                    session_env = dict(base_env)
+                    if meeting_join_url:
+                        session_env['MEETING_JOIN_URL'] = meeting_join_url
+                    if meeting_id:
+                        session_env['MEETING_ID'] = meeting_id
+                    if webinar_start_at:
+                        session_env['WEBINAR_START_AT'] = webinar_start_at
+                    if webinar_end_at:
+                        session_env['WEBINAR_END_AT'] = webinar_end_at
+                    session_env['WEBINAR_JOIN_LEAD_MINUTES'] = '30'
+                    if payment_link_ids:
+                        session_env['PAYMENT_LINK_IDS'] = payment_link_ids
+                    # sensible defaults for runtime identity
+                    session_env['BOT_DISPLAY_NAME'] = (
+                        os.environ.get('BOT_DISPLAY_NAME')
+                        or base_env.get('BOT_DISPLAY_NAME')
+                        or f"Hermes AI ({safe_key})"
+                    )
+                    host_email = (
+                        os.environ.get('HOST_EMAIL')
+                        or os.environ.get('HOST')
+                        or base_env.get('HOST_EMAIL')
+                        or ''
+                    )
+                    if host_email:
+                        session_env['HOST_EMAIL'] = host_email
+                    # attempt to map to a known slot id
+                    matched_slot = None
+                    try:
+                        for s in _load_slots():
+                            if meeting_id and str(s.get('meeting_id')) == str(meeting_id):
+                                matched_slot = s.get('id')
+                                break
+                            if s.get('id') == session_key or s.get('env_file', '') == env_filename:
+                                matched_slot = s.get('id')
+                                break
+                    except Exception:
+                        matched_slot = None
+                    if matched_slot:
+                        session_env['SESSION_ID'] = matched_slot
+                    env_path.write_text(
+                        "\n".join(f"{k}={v}" for k, v in session_env.items() if v != "") + "\n"
+                    )
+
+                    project = f"hermes_{safe_key.lower()}"[:32]
+                    env_for_run = os.environ.copy()
+                    env_for_run['BOT_ENV_FILE'] = env_filename
+                    if schedule_path:
+                        env_for_run['SCHEDULE_PATH'] = str(schedule_path)
+                        env_for_run['SCHEDULE_TZ'] = 'Asia/Kolkata'
+
+                    cmd = ['docker', 'compose', '-p', project, 'up', '-d', '--build']
+                    try:
+                        r = subprocess.run(cmd, cwd=str(REPO), env=env_for_run, capture_output=True, text=True, timeout=180)
+                        if r.returncode != 0:
+                            return self._json(500, {"ok": False, "error": f"docker compose failed: {r.stderr.strip()}", "out": r.stdout})
+                    except Exception as e:
+                        return self._json(500, {"ok": False, "error": f"docker compose error: {e}"})
+
+                    entry = {"type": "docker", "project": project, "env_file": env_filename, "schedule_file": str(schedule_path) if schedule_path else None, "started_at": datetime.now(TZ).isoformat(), "compose_out": r.stdout, "matched_slot": matched_slot}
+                    _bot_procs[session_key] = entry
+                    return self._json(200, {"ok": True, "session_key": session_key, "project": project, "compose_out": r.stdout, "matched_slot": matched_slot})
+
+                # fallback: spawn local python process
+                env = os.environ.copy()
+                env['ZOOM_BACKEND'] = 'bridge'
+                bridge_proc = None
+                bridge_port = None
+                try:
+                    bridge_port = _pick_playwright_port()
+                    bridge_env = os.environ.copy()
+                    bridge_env['BRIDGE_PORT'] = str(bridge_port)
+                    if webinar_end_at:
+                        bridge_env['BRIDGE_END_AT'] = webinar_end_at
+                    bridge_env.pop('PLAYWRIGHT_BROWSERS_PATH', None)
+                    bridge_proc = subprocess.Popen(
+                        ['node', 'index.js'],
+                        cwd=str(REPO / 'bridge' / 'node-bridge'),
+                        env=bridge_env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    import time as _time
+                    ready = False
+                    for _ in range(40):
+                        try:
+                            with urllib.request.urlopen(
+                                f'http://127.0.0.1:{bridge_port}/health', timeout=0.5
+                            ):
+                                ready = True
+                                break
+                        except Exception:
+                            if bridge_proc.poll() is not None:
+                                break
+                            _time.sleep(0.25)
+                    if not ready:
+                        raise RuntimeError(f'Playwright bridge failed on port {bridge_port}')
+                    env['BRIDGE_URL'] = f'http://127.0.0.1:{bridge_port}'
+                    env['BRIDGE_PORT'] = str(bridge_port)
+                except Exception as e:
+                    if bridge_proc and bridge_proc.poll() is None:
+                        bridge_proc.terminate()
+                    return self._json(500, {"ok": False, "error": str(e)})
+                if meeting_join_url:
+                    env['MEETING_JOIN_URL'] = meeting_join_url
+                if meeting_id:
+                    env['MEETING_ID'] = meeting_id
+                if webinar_start_at:
+                    env['WEBINAR_START_AT'] = webinar_start_at
+                if webinar_end_at:
+                    env['WEBINAR_END_AT'] = webinar_end_at
+                env['WEBINAR_JOIN_LEAD_MINUTES'] = '30'
+                if payment_link_ids:
+                    env['PAYMENT_LINK_IDS'] = payment_link_ids
+                if schedule_path:
+                    env['SCHEDULE_FILE'] = str(schedule_path)
+                    env['SCHEDULE_TZ'] = 'Asia/Kolkata'
+
+                default_python = REPO / '.venv' / 'bin' / 'python'
+                python_value = env.get('PYTHON') or (
+                    str(default_python) if default_python.exists() else sys.executable
+                )
+                python_cmd = shlex.split(python_value)
+                cmd = python_cmd + ['-m', 'src.main']
+                try:
+                    proc = subprocess.Popen(cmd, env=env, cwd=str(REPO))
+                except Exception as e:
+                    if bridge_proc and bridge_proc.poll() is None:
+                        bridge_proc.terminate()
+                    return self._json(500, {"ok": False, "error": f"failed to start bot: {e}"})
+
+                # also write env file for local runs so user can inspect defaults
+                env_filename = f".env.{safe_key}"
+                env_path = REPO / env_filename
+                try:
+                    bot_display = os.environ.get('BOT_DISPLAY_NAME') or f"Hermes AI ({safe_key})"
+                    host_email = os.environ.get('HOST_EMAIL') or os.environ.get('HOST') or ''
+                    lines = []
+                    if meeting_join_url:
+                        lines.append(f'MEETING_JOIN_URL={meeting_join_url}')
+                    if meeting_id:
+                        lines.append(f'MEETING_ID={meeting_id}')
+                    if bridge_port:
+                        lines.append(f'BRIDGE_PORT={bridge_port}')
+                        lines.append(f'BRIDGE_URL=http://127.0.0.1:{bridge_port}')
+                    if webinar_start_at:
+                        lines.append(f'WEBINAR_START_AT={webinar_start_at}')
+                    if webinar_end_at:
+                        lines.append(f'WEBINAR_END_AT={webinar_end_at}')
+                    lines.append('WEBINAR_JOIN_LEAD_MINUTES=30')
+                    if payment_link_ids:
+                        lines.append(f'PAYMENT_LINK_IDS={payment_link_ids}')
+                    lines.append(f'BOT_DISPLAY_NAME={bot_display}')
+                    if host_email:
+                        lines.append(f'HOST_EMAIL={host_email}')
+                    # try map slot id
+                    matched_slot = None
+                    try:
+                        for s in _load_slots():
+                            if meeting_id and str(s.get('meeting_id')) == str(meeting_id):
+                                matched_slot = s.get('id')
+                                break
+                    except Exception:
+                        matched_slot = None
+                    if matched_slot:
+                        lines.append(f'SESSION_ID={matched_slot}')
+                    env_path.write_text("\n".join(lines) + "\n")
+                except Exception:
+                    matched_slot = None
+
+                entry = {"type": "proc", "proc": proc, "bridge_proc": bridge_proc, "bridge_port": bridge_port, "started_at": datetime.now(TZ).isoformat(), "schedule_file": str(schedule_path) if schedule_path else None, "env_file": env_filename, "matched_slot": matched_slot}
+                _bot_procs[session_key] = entry
+
+            return self._json(200, {"ok": True, "pid": getattr(proc, 'pid', None) if not use_docker else None, "session_key": session_key, "schedule_file": str(schedule_path) if schedule_path else None, "matched_slot": matched_slot})
+
+        # Bot control endpoints
+        if path == '/api/bot/stop':
+            # stop single or all; query ?session_key=... or body unknown
+            qs = parse_qs(parsed.query)
+            sess = qs.get('session_key', [None])[0]
+            stopped = []
+            with _bot_procs_lock:
+                if sess:
+                    entry = _bot_procs.get(sess)
+                    if entry:
+                        if entry.get('type') == 'proc':
+                            p = entry.get('proc')
+                            if p and p.poll() is None:
+                                try:
+                                    p.terminate()
+                                except Exception:
+                                    try:
+                                        p.kill()
+                                    except Exception:
+                                        pass
+                            bp = entry.get('bridge_proc')
+                            if bp and bp.poll() is None:
+                                try:
+                                    bp.terminate()
+                                except Exception:
+                                    pass
+                        elif entry.get('type') == 'docker':
+                            project = entry.get('project')
+                            try:
+                                subprocess.run(['docker', 'compose', '-p', project, 'down', '--remove-orphans'], cwd=str(REPO), capture_output=True, text=True, timeout=60)
+                            except Exception:
+                                pass
+                        _bot_procs.pop(sess, None)
+                        stopped = [sess]
+                else:
+                    for k, entry in list(_bot_procs.items()):
+                        if entry.get('type') == 'proc':
+                            p = entry.get('proc')
+                            if p and p.poll() is None:
+                                try:
+                                    p.terminate()
+                                except Exception:
+                                    try:
+                                        p.kill()
+                                    except Exception:
+                                        pass
+                            bp = entry.get('bridge_proc')
+                            if bp and bp.poll() is None:
+                                try:
+                                    bp.terminate()
+                                except Exception:
+                                    pass
+                        elif entry.get('type') == 'docker':
+                            project = entry.get('project')
+                            try:
+                                subprocess.run(['docker', 'compose', '-p', project, 'down', '--remove-orphans'], cwd=str(REPO), capture_output=True, text=True, timeout=60)
+                            except Exception:
+                                pass
+                        _bot_procs.pop(k, None)
+                        stopped.append(k)
+            return self._json(200, {"ok": True, "stopped": stopped})
+
         return self._json(404, {"ok": False, "error": "not found"})
 
 
 def main() -> None:
     _load_dotenv()
+    threading.Thread(target=_metrics_tracker_loop, name="hermes-metrics", daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Hermes Mission Control → http://{HOST}:{PORT}", flush=True)
     print(

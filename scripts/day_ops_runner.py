@@ -17,6 +17,7 @@ import json
 import re
 import subprocess
 import time
+import sys
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -142,7 +143,7 @@ def sync_tracking_sheet(session_id: str) -> tuple[bool, str]:
     try:
         r = subprocess.run(
             [
-                str(ROOT / ".venv/bin/python"),
+                sys.executable,
                 str(ROOT / "scripts/sync_tracking_sheet.py"),
                 "--session",
                 session_id,
@@ -229,6 +230,43 @@ def capture_payment_drop(s: dict, first: dict, counts: dict, pay: dict) -> None:
         f"payment_link_drop_attendees_count {sid} :{s['port']} "
         f"at={first['time']} count={entry['attendees_count']} counts={counts}"
     )
+
+
+def env_datetime(env_file: str, key: str) -> datetime | None:
+    """Read a full ISO datetime (e.g. WEBINAR_END_AT) from a session's env file.
+
+    Unlike session_start_ist/session_end_ist (time-of-day only, always assumed to be
+    today), this carries the actual registration date, so it is what tells a session
+    registered yesterday apart from one registered today.
+    """
+    env_path = ROOT / env_file
+    if not env_path.exists():
+        return None
+    for line in env_path.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            val = line.split("=", 1)[1].strip().strip("'\"")
+            if not val:
+                return None
+            try:
+                dt = datetime.fromisoformat(val)
+            except ValueError:
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=TZ)
+    return None
+
+
+def persist_force_disable(session_id: str) -> None:
+    """Write force_disabled=true back to the manifest so an expired session stays
+    disabled across restarts instead of being auto-adopted again on a future day."""
+    try:
+        manifest = json.loads(MANIFEST.read_text())
+        for entry in manifest.get("sessions") or []:
+            if entry.get("id") == session_id:
+                entry["force_disabled"] = True
+                entry["enabled"] = False
+        MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as e:
+        log(f"WARN could not persist force_disabled for {session_id}: {e}")
 
 
 def start_slot(port: int, env_file: str) -> bool:
@@ -381,17 +419,39 @@ def main() -> None:
 
     while True:
         n = now()
-        if n.hour >= 23 and n.minute >= 45:
-            log("past 23:45 — day_ops_runner exiting")
-            break
+        # Render worker is intentionally persistent.
+        # Keep watching for future sessions instead of exiting at 23:45.
 
         # Periodically pick up join URLs dropped into Excel / .env
         if int(time.time()) % 60 < TICK_SEC + 1:
             try_fill_missing_join_from_excel(sessions)
-            # Re-apply force_disabled / enabled from disk
+            # Re-apply force_disabled / enabled from disk, and adopt sessions
+            # registered after this runner started (e.g. via register_session.py
+            # or the dashboard Connect form) so a long-lived `npm run build`
+            # process doesn't need a restart to pick up new webinars.
             try:
                 disk = json.loads(MANIFEST.read_text()).get("sessions") or []
                 by_id = {x["id"]: x for x in disk}
+                known_ids = {s["id"] for s in sessions}
+                for d in disk:
+                    if d["id"] in known_ids:
+                        continue
+                    sessions.append(d)
+                    lead = int(d.get("start_lead_minutes") or 30)
+                    st = parse_hhmmss(d["session_start_ist"])
+                    go = st - timedelta(minutes=lead)
+                    log(
+                        f"discovered new session {d['id']} :{d['port']} "
+                        f"start={d['session_start_ist']} auto_start={go.strftime('%H:%M:%S')}"
+                    )
+                    fp = first_payment_from_schedule(ROOT / d["schedule_file"])
+                    if fp:
+                        first_pay[d["id"]] = fp
+                        log(f"  first_payment {d['id']} @ {fp['time']} → {fp['url'][:60]}")
+                    h = health(int(d["port"]))
+                    if h.get("meeting_state") in ("waiting", "in_meeting", "joining"):
+                        started.add(d["id"])
+                        log(f"already live {d['id']} :{d['port']} state={h.get('meeting_state')}")
                 for s in sessions:
                     d = by_id.get(s["id"])
                     if not d:
@@ -427,6 +487,24 @@ def main() -> None:
                 continue
             sid = s["id"]
             port = int(s["port"])
+
+            # session_start_ist/session_end_ist are time-of-day only, so a session
+            # registered on a previous day looks identical to one registered today
+            # once the clock rolls past midnight — without this check it would be
+            # auto-(re)started at the same clock time forever. WEBINAR_END_AT in the
+            # env file carries the real date; a generous 3h grace keeps late sheet
+            # syncs/retries (which already run up to end+120min) unaffected.
+            real_end = env_datetime(s["env_file"], "WEBINAR_END_AT")
+            if real_end and now() > real_end + timedelta(hours=3):
+                if sid in started or health(port).get("meeting_state") in ("waiting", "in_meeting", "joining"):
+                    log(f"expiring stale session {sid} :{port} (ended {real_end.isoformat()}) — stopping bridge")
+                    subprocess.run([str(HERMES), "stop", str(port)], cwd=str(ROOT), check=False)
+                    started.discard(sid)
+                s["force_disabled"] = True
+                s["enabled"] = False
+                persist_force_disable(sid)
+                continue
+
             lead = int(s.get("start_lead_minutes") or 30)
             peak_mins = int(s.get("peak_window_minutes") or 60)
             start_dt = parse_hhmmss(s["session_start_ist"])
@@ -544,7 +622,7 @@ def main() -> None:
             last_daily_md = time.time()
             try:
                 r = subprocess.run(
-                    [str(ROOT / ".venv/bin/python"), str(ROOT / "scripts/write_daily_run.py")],
+                    [sys.executable, str(ROOT / "scripts/write_daily_run.py")],
                     cwd=str(ROOT),
                     capture_output=True,
                     text=True,
