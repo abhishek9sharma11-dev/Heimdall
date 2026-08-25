@@ -3,4 +3,5 @@ __pycache__
 bridge/build
 vector_store
 .env
+dashboard/slots.json
 *.pyc

@@ -126,6 +126,10 @@ def _load_dotenv() -> None:
 
 
 def _load_slots() -> list[dict[str, Any]]:
+    if not SLOTS_PATH.exists() and os.environ.get("HERMES_WORKER_MODE", "0") == "1":
+        # Production worker registrations live in today_sessions.json.  The
+        # local slots file is intentionally not required or synthesized here.
+        return []
     slots = json.loads(SLOTS_PATH.read_text())
     out: list[dict[str, Any]] = []
     for s in slots:
