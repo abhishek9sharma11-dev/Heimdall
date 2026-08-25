@@ -23,6 +23,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+try:
+    from scripts.slack_reporting import finalize_report, metric_row
+except ModuleNotFoundError:
+    from slack_reporting import finalize_report, metric_row
+
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "schedules" / "today_sessions.json"
 HERMES = ROOT / "scripts" / "hermes_slots.sh"
@@ -36,6 +41,7 @@ PEAK_INTERVAL = 10
 DAILY_MD_INTERVAL = 60
 # Wait a few minutes after session_end so late payments can land, then write Tracking.
 SHEET_SYNC_GRACE_MIN = 5
+SLACK_REPORT_OUT = Path("/tmp/hermes-slack-reports.json")
 PAYMENT_LINK_RE = re.compile(r"https?://link\.outskill\.com/[^\s<>\"']+", re.I)
 
 EVAL = r"""
@@ -136,6 +142,19 @@ def load_sheet_sync() -> dict:
 
 def save_sheet_sync(data: dict) -> None:
     SHEET_SYNC_OUT.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def load_slack_reports() -> dict:
+    if SLACK_REPORT_OUT.exists():
+        try:
+            return json.loads(SLACK_REPORT_OUT.read_text())
+        except Exception:
+            pass
+    return {"sessions": {}}
+
+
+def save_slack_reports(data: dict) -> None:
+    SLACK_REPORT_OUT.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def sync_tracking_sheet(session_id: str) -> tuple[bool, str]:
@@ -384,6 +403,7 @@ def main() -> None:
     peak = load_peak()
     pay = load_pay_drops()
     sheet_sync = load_sheet_sync()
+    slack_reports = load_slack_reports()
     first_pay: dict[str, dict] = {}
     last_daily_md = 0.0
     for s in sessions:
@@ -616,6 +636,36 @@ def main() -> None:
                     log(f"sheet_sync OK {sid} :{port} — Tracking updated")
                 else:
                     log(f"sheet_sync FAILED {sid} :{port}: {detail[-200:]}")
+
+            report_key = f"{n.strftime('%Y-%m-%d')}:{sid}"
+            report_status = (slack_reports.get("sessions") or {}).get(report_key) or {}
+            if (
+                sid in started
+                and not report_status.get("completed")
+                and n >= sync_at
+                and n <= end_dt + timedelta(minutes=120)
+            ):
+                peak_row = metric_row(peak, s.get("meeting_id"), payment=False)
+                payment_row = metric_row(pay, s.get("meeting_id"), payment=True)
+                try:
+                    result = finalize_report(s, peak_row, payment_row, prior)
+                    delivery = result.get("delivery") or {}
+                    report_status = {
+                        "completed": True,
+                        "date": n.strftime("%Y-%m-%d"),
+                        "report_files": result.get("report_files") or [],
+                        "slack_ok": bool(delivery.get("ok")),
+                        "slack_error": delivery.get("error") or delivery.get("skipped"),
+                        "sent_at": n.isoformat(),
+                    }
+                    slack_reports.setdefault("sessions", {})[report_key] = report_status
+                    save_slack_reports(slack_reports)
+                    if delivery.get("ok"):
+                        log(f"slack_report OK {sid} :{port}")
+                    else:
+                        log(f"slack_report skipped/failed {sid} :{port} — finalization continued")
+                except Exception as e:
+                    log(f"slack_report failed {sid} :{port} — finalization continued: {type(e).__name__}")
 
         # Refresh docs/DAILY-RUN-TODAY.md periodically
         if time.time() - last_daily_md >= DAILY_MD_INTERVAL:
