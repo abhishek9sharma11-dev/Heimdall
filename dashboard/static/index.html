@@ -83,13 +83,16 @@
         <span id="sys-label" class="text-[12px] font-semibold tracking-[0.05em] uppercase text-status-error">Offline</span>
       </div>
       <div class="flex flex-col items-center">
-        <h1 class="text-[18px] sm:text-[20px] font-semibold tracking-tight">Hermes</h1>
+        <h1 class="text-[18px] sm:text-[20px] font-semibold tracking-tight">Heimdall</h1>
         <span class="text-[11px] text-text-secondary hidden sm:block">Mission Control</span>
       </div>
       <div class="flex items-center gap-2 min-w-[140px] justify-end">
         <button id="btn-refresh" class="btn-ghost hidden sm:inline-flex items-center gap-1" title="Force refresh payments">
           <span class="material-symbols-outlined text-[16px]">sync</span> Sync
         </button>
+        <a href="/connect.html" class="btn-ghost hidden sm:inline-flex items-center gap-1" title="Register a webinar session">
+          <span class="material-symbols-outlined text-[16px]">add_circle</span> Register
+        </a>
         <div class="w-8 h-8 rounded-full bg-primary-container flex items-center justify-center">
           <span class="material-symbols-outlined text-on-primary-container text-[18px]">auto_awesome</span>
         </div>
@@ -103,7 +106,7 @@
 
       <!-- HOME -->
       <section id="view-home" class="view active pb-10 space-y-6">
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 pt-4">
+        <div class="grid grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 pt-4">
           <div class="bg-surface-container rounded-xl p-5 flex flex-col gap-2">
             <div class="flex items-center justify-between">
               <span class="material-symbols-outlined text-status-live text-[20px]">sensors</span>
@@ -119,14 +122,6 @@
             </div>
             <span id="m-bots" class="text-[32px] font-semibold tracking-tight text-text-primary leading-10">0</span>
             <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Bots Connected</span>
-          </div>
-          <div class="bg-surface-container rounded-xl p-5 flex flex-col gap-2">
-            <div class="flex items-center justify-between">
-              <span class="material-symbols-outlined text-tertiary text-[20px]">payments</span>
-              <span id="m-pay-count" class="text-[13px] text-tertiary">0 pays</span>
-            </div>
-            <span id="m-revenue" class="text-[22px] sm:text-[28px] font-semibold tracking-tight text-text-primary leading-tight break-words">—</span>
-            <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Tracked Revenue</span>
           </div>
           <div class="bg-surface-container rounded-xl p-5 flex flex-col gap-2">
             <div class="flex items-center justify-between">
@@ -240,6 +235,12 @@
 
     function statusPill(slot) {
       const state = slot.health?.meeting_state;
+      if (slot.phase === "ended" || slot.status === "ended") {
+        return `<div class="flex items-center gap-2 mt-1">
+          <div class="w-2 h-2 rounded-full bg-text-secondary"></div>
+          <span class="text-[12px] font-semibold tracking-[0.05em] text-text-secondary uppercase">Ended</span>
+        </div>`;
+      }
       if (state === "in_meeting") {
         return `<div class="flex items-center gap-2 mt-1">
           <div class="w-2 h-2 rounded-full bg-status-live pulse-live"></div>
@@ -396,6 +397,14 @@
               </div>
             </div>
             <p class="text-[11px] text-text-secondary">${esc(slot.elapsed || "—")} · ${slot.schedule_items || 0} schedule items · ${esc(rev.sub)}</p>
+            <div class="grid grid-cols-3 sm:grid-cols-6 gap-2 border-t border-border-subtle pt-3">
+              ${reportMetric("Peak", slot.report?.peak_showup)}
+              ${reportMetric("Retention", slot.report?.retention)}
+              ${reportMetric("INR", slot.report?.inr)}
+              ${reportMetric("USD", slot.report?.usd)}
+              ${reportMetric("Payments", slot.report?.total_payments)}
+              ${reportMetric("Registrations", slot.report?.zoom_registrations)}
+            </div>
             <div class="flex flex-wrap items-center gap-2 pt-1">
               <label class="btn-ghost inline-flex items-center gap-1 cursor-pointer !normal-case tracking-normal">
                 <span class="material-symbols-outlined text-[16px]">upload_file</span>
@@ -403,6 +412,9 @@
                 <input type="file" class="hidden" accept=".csv,.tsv,.txt,.xlsx,.xlsm" data-schedule-upload="${esc(slot.id)}" />
               </label>
               <a href="/api/schedule-template.csv" class="btn-ghost inline-flex items-center gap-1" download>Template</a>
+              <a href="${slot.report_url || "#"}" class="btn-ghost inline-flex items-center gap-1" download>
+                <span class="material-symbols-outlined text-[16px]">download</span> Report CSV
+              </a>
               <a href="${href}" class="btn-primary inline-flex items-center gap-1 ml-auto">
                 Payments <span class="material-symbols-outlined text-[16px]">chevron_right</span>
               </a>
@@ -410,6 +422,10 @@
             <p class="text-[12px] text-text-secondary min-h-[1rem]" data-schedule-msg="${esc(slot.id)}"></p>
           </div>
         </div>`;
+    }
+
+    function reportMetric(label, value) {
+      return `<div><span class="text-[9px] font-semibold tracking-[0.05em] text-text-secondary uppercase">${label}</span><p class="text-[14px] text-text-primary">${value === null || value === undefined || value === "" ? "—" : esc(value)}</p></div>`;
     }
 
     function sessionRow(slot) {
@@ -658,8 +674,6 @@
         data.metrics.bots_connected === data.metrics.bots_total ? "Stable" :
         data.metrics.bots_connected > 0 ? "Partial" : "Down";
       document.getElementById("m-peak").textContent = (data.metrics.peak_attendees || 0).toLocaleString();
-      document.getElementById("m-revenue").textContent = data.metrics.todays_revenue_display ?? "—";
-      document.getElementById("m-pay-count").textContent = `${data.metrics.payment_count || 0} pays`;
       document.getElementById("m-live-delta").textContent =
         data.metrics.live_sessions > 0 ? "Active" : "Idle";
       document.getElementById("clock-ist").textContent = `${data.now_ist} IST`;
@@ -670,7 +684,11 @@
         const key = s.account || "Zoom";
         (byAccount[key] ||= []).push(s);
       }
-      const groups = Object.keys(byAccount).sort();
+      const groups = Object.keys(byAccount).sort((a, b) => {
+        const aScheduled = byAccount[a].some((s) => s.phase === "scheduled");
+        const bScheduled = byAccount[b].some((s) => s.phase === "scheduled");
+        return Number(bScheduled) - Number(aScheduled) || a.localeCompare(b);
+      });
       cards.innerHTML = groups.map((acct) => `
         <div class="space-y-3">
           <div class="flex items-center justify-between">
@@ -678,7 +696,7 @@
             <span class="text-[11px] text-text-secondary">${byAccount[acct].length} session${byAccount[acct].length === 1 ? "" : "s"}</span>
           </div>
           <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            ${byAccount[acct].map(accountCard).join("")}
+            ${byAccount[acct].sort((a, b) => Number(b.phase === "scheduled") - Number(a.phase === "scheduled")).map(accountCard).join("")}
           </div>
         </div>`).join("") || `<p class="text-text-secondary">No sessions in dashboard/slots.json</p>`;
       bindPaymentForms(cards);
@@ -700,6 +718,52 @@
         console.error(e);
       }
     }
+
+    // If loaded with ?session_key=..., switch to Sessions view and show a brief banner
+    (function checkStartupSession() {
+      try {
+        const params = new URLSearchParams(location.search);
+        const sk = params.get('session_key');
+        if (sk) {
+          // switch to Sessions view
+          document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('nav-active'));
+          document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+          document.querySelector('[data-view="sessions"]').classList.add('nav-active');
+          document.getElementById('view-sessions').classList.add('active');
+          const banner = document.getElementById('db-banner');
+          banner.classList.remove('hidden');
+          const slot = params.get('session_slot');
+          if (slot) {
+            banner.innerHTML = `Started session ${sk}. <a href="#" id="jump-to-session" style="color:#d2bbff;text-decoration:underline">Open session ${slot}</a>`;
+            setTimeout(() => banner.classList.add('hidden'), 10000);
+            // when session cards are rendered, scroll to slot
+            const tryScroll = () => {
+              const el = document.querySelector(`[data-slot-card="${slot}"]`);
+              if (el) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                el.style.boxShadow = '0 0 0 3px rgba(210,187,255,0.2)';
+                el.style.border = '2px solid #d2bbff';
+                setTimeout(() => { el.style.boxShadow=''; el.style.border='1px solid #1f1f1f'; }, 8000);
+                document.getElementById('jump-to-session').addEventListener('click', (e) => { e.preventDefault(); el.scrollIntoView({ behavior: 'smooth', block: 'center' }); });
+                return true;
+              }
+              return false;
+            };
+            // try now, or after refresh polling a few times
+            if (!tryScroll()) {
+              let attempts = 0;
+              const id = setInterval(() => {
+                attempts += 1;
+                if (tryScroll() || attempts > 8) clearInterval(id);
+              }, 800);
+            }
+          } else {
+            banner.textContent = `Started session ${sk}. See Sessions below.`;
+            setTimeout(() => banner.classList.add('hidden'), 8000);
+          }
+        }
+      } catch (e) { /* ignore */ }
+    })();
 
     document.querySelectorAll(".nav-btn").forEach((btn) => {
       btn.addEventListener("click", () => {

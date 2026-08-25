@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Heimdall — Register Webinar</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>body{background:#000;color:#fff;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:20px} .field{width:100%;padding:.5rem;border-radius:.5rem;background:#0a0a0a;border:1px solid #222;color:#fff}</style>
+</head>
+<body>
+  <h1 style="font-size:20px;margin-bottom:8px">Register Webinar Session</h1>
+  <p style="color:#9ca3af;margin-bottom:12px">Enter webinar details and optionally upload a schedule. In worker mode this registers the session for the persistent worker; it does not start Zoom from the dashboard.</p>
+
+  <form id="connect-form">
+    <label style="display:block;margin-bottom:8px">
+      <div style="font-size:12px;color:#9ca3af">Webinar ID (optional)</div>
+      <input class="field" name="meeting_id" id="meeting_id" placeholder="83981260244" />
+    </label>
+    <label style="display:block;margin-bottom:8px">
+      <div style="font-size:12px;color:#9ca3af">Panelist / Join Link (preferred)</div>
+      <input class="field" name="meeting_join_url" id="meeting_join_url" placeholder="https://us06web.zoom.us/w/83981260244?tk=..." />
+    </label>
+    <label style="display:block;margin-bottom:8px">
+      <div style="font-size:12px;color:#9ca3af">CSV/XLSX schedule file (time,text,poll)</div>
+      <input class="field" type="file" id="schedule_file" name="schedule_file" accept=".csv,.tsv,.txt,.xlsx,.xlsm" />
+    </label>
+    <label style="display:block;margin-bottom:8px">
+      <div style="font-size:12px;color:#9ca3af">Webinar start (IST; bot joins 30 minutes before)</div>
+      <input class="field" type="datetime-local" id="webinar_start_at" name="webinar_start_at" />
+      <div style="font-size:11px;color:#6b7280;margin-top:4px">If blank, the first CSV timestamp is used as today’s webinar start.</div>
+    </label>
+    <label style="display:block;margin-bottom:8px">
+      <div style="font-size:12px;color:#9ca3af">Webinar end (IST; browser closes and reconnect stops)</div>
+      <input class="field" type="datetime-local" id="webinar_end_at" name="webinar_end_at" />
+      <div style="font-size:11px;color:#6b7280;margin-top:4px">If blank, the last CSV timestamp is used as today’s end.</div>
+    </label>
+    <label style="display:block;margin-bottom:8px">
+      <div style="font-size:12px;color:#9ca3af">Payment link IDs (optional, comma-separated)</div>
+      <input class="field" id="payment_link_ids" name="payment_link_ids" placeholder="uuid,uuid" />
+    </label>
+    <label style="display:block;margin-bottom:8px">
+      <label style="font-size:12px;color:#9ca3af"><input type="checkbox" id="use_docker" /> Use Docker/C++ headless mode (leave unchecked for visible Playwright browser)</label>
+    </label>
+
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button id="btn-connect" class="btn-primary" type="button" style="background:#7c3aed;padding:.6rem 1rem;border-radius:.5rem">Register Session</button>
+      <button id="btn-stop" type="button" class="btn-ghost" style="background:transparent;border:1px solid #333;padding:.5rem .9rem;border-radius:.5rem">Stop Bot</button>
+    </div>
+  </form>
+
+  <div id="status" style="margin-top:12px;color:#cbd5e1"></div>
+  <div id="running-sessions" style="margin-top:12px;color:#cbd5e1"></div>
+
+  <script>
+    async function status() {
+      try {
+        const r = await fetch('/api/bot/status');
+        const j = await r.json();
+        const el = document.getElementById('running-sessions');
+        if (j.sessions && j.sessions.length) {
+          el.innerHTML = '<div style="font-weight:600;margin-bottom:6px">Running sessions</div>' + j.sessions.map(s => `
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+              <div style="flex:1">${s.session_key} — ${s.running ? 'running' : 'stopped'} ${s.pid ? '(pid='+s.pid+')' : ''}</div>
+              <button data-stop="${encodeURIComponent(s.session_key)}" style="padding:.4rem .6rem;border-radius:.4rem;border:1px solid #333;background:transparent;color:#fff">Stop</button>
+            </div>
+          `).join('');
+        } else {
+          el.textContent = 'No running sessions';
+        }
+      } catch (e) {
+        document.getElementById('status').textContent = 'Status unavailable';
+      }
+    }
+    document.getElementById('btn-connect').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-connect');
+      btn.disabled = true;
+      document.getElementById('status').textContent = 'Uploading & starting…';
+      const meeting_id = document.getElementById('meeting_id').value.trim();
+      const join = document.getElementById('meeting_join_url').value.trim();
+      const webinar_start_at = document.getElementById('webinar_start_at').value.trim();
+      const webinar_end_at = document.getElementById('webinar_end_at').value.trim();
+      const pay = document.getElementById('payment_link_ids').value.trim();
+      const use_docker = document.getElementById('use_docker').checked;
+      const file = document.getElementById('schedule_file').files[0];
+      const payload = { meeting_id, meeting_join_url: join, webinar_start_at, webinar_end_at, payment_link_ids: pay };
+      try {
+        if (file) {
+          const buf = await file.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let binary = '';
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+          }
+          payload.schedule_base64 = btoa(binary);
+          payload.schedule_filename = file.name;
+        }
+        payload.use_docker = use_docker;
+
+        const r = await fetch('/api/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const j = await r.json();
+        if (!r.ok || !j.ok) throw new Error(j.error || 'connect failed');
+      if (j.registered) {
+        document.getElementById('status').textContent = `Registered for worker discovery · port ${j.port || 'allocated'}` + (j.schedule_file ? ` · schedule: ${j.schedule_file}` : '');
+        setTimeout(status, 500);
+        return;
+      }
+      document.getElementById('status').textContent = `Started bot pid=${j.pid}` + (j.schedule_file ? ` · schedule: ${j.schedule_file}` : '');
+        // Redirect to main dashboard and highlight session
+        const key = j.session_key || j.project || j.pid;
+        const slot = j.matched_slot;
+        if (key) {
+          const qs = slot ? `?session_key=${encodeURIComponent(key)}&session_slot=${encodeURIComponent(slot)}` : `?session_key=${encodeURIComponent(key)}`;
+          window.location = `/${qs}`;
+          return;
+        }
+      } catch (e) {
+        document.getElementById('status').textContent = `Error: ${e.message}`;
+      } finally {
+        btn.disabled = false;
+        setTimeout(status, 500);
+      }
+    });
+
+    document.getElementById('btn-stop').addEventListener('click', async () => {
+      try {
+        const r = await fetch('/api/bot/stop', { method: 'POST' });
+        const j = await r.json();
+        document.getElementById('status').textContent = j.stopped && j.stopped.length ? `Stopped: ${j.stopped.join(',')}` : 'Stopped';
+      } catch (e) {
+        document.getElementById('status').textContent = 'Stop failed';
+      } finally {
+        setTimeout(status, 500);
+      }
+    });
+
+    document.getElementById('running-sessions').addEventListener('click', async (e) => {
+      const b = e.target.closest('button[data-stop]');
+      if (!b) return;
+      const key = decodeURIComponent(b.getAttribute('data-stop'));
+      try {
+        const r = await fetch(`/api/bot/stop?session_key=${encodeURIComponent(key)}`, { method: 'POST' });
+        const j = await r.json();
+        document.getElementById('status').textContent = j.stopped && j.stopped.length ? `Stopped: ${j.stopped.join(',')}` : 'Stopped';
+      } catch (err) {
+        document.getElementById('status').textContent = 'Stop failed';
+      } finally {
+        setTimeout(status, 500);
+      }
+    });
+
+    status();
+  </script>
+</body>
+</html>
