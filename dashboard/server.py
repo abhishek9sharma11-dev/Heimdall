@@ -907,6 +907,12 @@ class Handler(SimpleHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        if path == "/health":
+            return self._json(200, {
+                "status": "ok",
+                "worker_mode": os.environ.get("HERMES_WORKER_MODE", "0") == "1",
+            })
+
         if path == "/api/status":
             force = qs.get("force", ["0"])[0] in ("1", "true", "yes")
             return self._json(200, build_status(force_payments=force))
