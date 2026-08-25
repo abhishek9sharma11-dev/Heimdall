@@ -14,7 +14,9 @@ Does not stop other sessions. Safe to leave running all day.
 from __future__ import annotations
 
 import json
+import os
 import re
+import socket
 import subprocess
 import time
 import sys
@@ -23,10 +25,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# The launcher invokes this file by absolute path. Ensure repository packages
+# remain importable in that mode as well as when run from the repository root.
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 try:
     from scripts.slack_reporting import finalize_report, metric_row
 except ModuleNotFoundError:
     from slack_reporting import finalize_report, metric_row
+
+from dashboard.session_time import normalize_session_time
+from dashboard import session_store
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "schedules" / "today_sessions.json"
@@ -43,6 +54,7 @@ DAILY_MD_INTERVAL = 60
 SHEET_SYNC_GRACE_MIN = 5
 SLACK_REPORT_OUT = Path("/tmp/hermes-slack-reports.json")
 PAYMENT_LINK_RE = re.compile(r"https?://link\.outskill\.com/[^\s<>\"']+", re.I)
+WORKER_OWNER = f"{socket.gethostname()}:{os.getpid()}"
 
 EVAL = r"""
 var text = (document.body && document.body.innerText) || '';
@@ -75,9 +87,115 @@ def now() -> datetime:
 
 
 def parse_hhmmss(s: str) -> datetime:
-    h, m, sec = map(int, s.split(":"))
+    h, m, sec = map(int, normalize_session_time(s, allow_empty=False).split(":"))
     n = now()
     return n.replace(hour=h, minute=m, second=sec, microsecond=0)
+
+
+def _valid_session(entry: object) -> dict:
+    if not isinstance(entry, dict):
+        raise ValueError("registration is not an object")
+    sid = str(entry.get("id") or entry.get("meeting_id") or "").strip()
+    if not sid:
+        raise ValueError("registration has no id")
+    if not entry.get("env_file"):
+        raise ValueError("missing env_file")
+    if not entry.get("schedule_file"):
+        raise ValueError("missing schedule_file")
+    int(entry.get("port"))
+    normalize_session_time(entry.get("session_start_ist"), allow_empty=False)
+    normalize_session_time(entry.get("session_end_ist"), allow_empty=False)
+    return entry
+
+
+def load_manifest_sessions() -> list[dict]:
+    """Load valid registrations and keep malformed entries from killing the worker."""
+    if not MANIFEST.exists():
+        log(f"manifest unavailable path={MANIFEST} — waiting for registrations")
+        return []
+    try:
+        raw = json.loads(MANIFEST.read_text()).get("sessions") or []
+    except Exception as exc:
+        log(f"manifest discovery failed path={MANIFEST}: {type(exc).__name__}: {exc}")
+        return []
+    sessions: list[dict] = []
+    for entry in raw:
+        try:
+            sessions.append(_valid_session(entry))
+        except Exception as exc:
+            sid = entry.get("id") if isinstance(entry, dict) else "<unknown>"
+            log(
+                f"discovery skipped session {sid} path={MANIFEST}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return sessions
+
+
+def _env_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text().splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def materialize_persistent_registrations() -> None:
+    """Rebuild runtime files from DB records after Render restarts."""
+    if not session_store.configured():
+        return
+    records = session_store.list_records()
+    try:
+        manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
+    except Exception:
+        manifest = {}
+    entries = [x for x in manifest.get("sessions") or [] if isinstance(x, dict)]
+    by_id = {str(x.get("id") or x.get("meeting_id")): x for x in entries}
+    changed = False
+    for record in records:
+        entry = record.get("session") or {}
+        sid = str(entry.get("id") or entry.get("meeting_id") or "")
+        if not sid:
+            continue
+        env_values = record.get("env_values") or {}
+        env_file = ROOT / str(entry.get("env_file") or "")
+        if env_values and not env_file.exists():
+            env_file.write_text(
+                "\n".join(f"{k}={v}" for k, v in env_values.items()) + "\n",
+                encoding="utf-8",
+            )
+        schedule = record.get("schedule") or {}
+        schedule_file = ROOT / str(entry.get("schedule_file") or "")
+        if schedule and not schedule_file.exists():
+            schedule_file.parent.mkdir(parents=True, exist_ok=True)
+            schedule_file.write_text(json.dumps(schedule, indent=2) + "\n", encoding="utf-8")
+        if sid not in by_id:
+            entries.append(entry)
+            by_id[sid] = entry
+            changed = True
+    if changed:
+        manifest["sessions"] = entries
+        manifest["date"] = manifest.get("date") or now().date().isoformat()
+        MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+        MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def import_legacy_registrations() -> None:
+    """Adopt a pre-database manifest once, preserving old HH:MM registrations."""
+    if not session_store.configured() or not MANIFEST.exists():
+        return
+    for entry in load_manifest_sessions():
+        sid = str(entry.get("id") or "")
+        env_values = _env_values(ROOT / str(entry["env_file"]))
+        schedule_path = ROOT / str(entry["schedule_file"])
+        try:
+            schedule = json.loads(schedule_path.read_text()) if schedule_path.exists() else {}
+            session_store.upsert({"session": entry, "env_values": env_values, "schedule": schedule})
+        except Exception as exc:
+            log(f"registration adoption failed session {sid} path={schedule_path}: {type(exc).__name__}: {exc}")
 
 
 def health(port: int) -> dict:
@@ -331,6 +449,39 @@ def start_slot(port: int, env_file: str) -> bool:
     return True
 
 
+def claim_for_start(session_id: str) -> bool:
+    try:
+        claimed = session_store.claim(session_id, WORKER_OWNER)
+    except Exception as exc:
+        log(f"claim failed session {session_id}: {type(exc).__name__}: {exc}")
+        return False
+    if not claimed:
+        log(f"skip start session {session_id}: already claimed or running")
+    return claimed
+
+
+def release_start_claim(session_id: str) -> None:
+    try:
+        session_store.release_claim(session_id, WORKER_OWNER)
+    except Exception as exc:
+        log(f"claim release failed session {session_id}: {type(exc).__name__}: {exc}")
+
+
+def start_claimed_session(session: dict) -> bool:
+    """Claim, start, and persist ownership; release the claim on startup failure."""
+    sid = str(session["id"])
+    if not claim_for_start(sid):
+        return False
+    if not start_slot(int(session["port"]), session["env_file"]):
+        release_start_claim(sid)
+        return False
+    try:
+        session_store.mark_running(sid, WORKER_OWNER)
+    except Exception as exc:
+        log(f"running-state update failed session {sid}: {type(exc).__name__}: {exc}")
+    return True
+
+
 def try_fill_missing_join_from_excel(sessions: list[dict]) -> None:
     """If Claude 199$ (or any blocked slot) gains a zoom URL in Workshops (2).xlsx, write it into .env."""
     xlsx = Path("/Users/growthschool/Downloads/Workshops (2).xlsx")
@@ -394,10 +545,12 @@ def try_fill_missing_join_from_excel(sessions: list[dict]) -> None:
 
 
 def main() -> None:
-    if not MANIFEST.exists():
-        raise SystemExit(f"missing {MANIFEST}")
-    manifest = json.loads(MANIFEST.read_text())
-    sessions = manifest["sessions"]
+    try:
+        import_legacy_registrations()
+        materialize_persistent_registrations()
+    except Exception as exc:
+        log(f"persistent registration sync failed: {type(exc).__name__}: {exc}")
+    sessions = load_manifest_sessions()
     started: set[str] = set()
     last_peak_at: dict[str, float] = {}
     peak = load_peak()
@@ -450,11 +603,16 @@ def main() -> None:
             # or the dashboard Connect form) so a long-lived `npm run build`
             # process doesn't need a restart to pick up new webinars.
             try:
-                disk = json.loads(MANIFEST.read_text()).get("sessions") or []
-                by_id = {x["id"]: x for x in disk}
+                try:
+                    import_legacy_registrations()
+                    materialize_persistent_registrations()
+                except Exception as exc:
+                    log(f"persistent discovery failed path={MANIFEST}: {type(exc).__name__}: {exc}")
+                disk = load_manifest_sessions()
+                by_id = {str(x.get("id")): x for x in disk}
                 known_ids = {s["id"] for s in sessions}
                 for d in disk:
-                    if d["id"] in known_ids:
+                    if str(d.get("id")) in known_ids:
                         continue
                     sessions.append(d)
                     lead = int(d.get("start_lead_minutes") or 30)
@@ -481,8 +639,8 @@ def main() -> None:
                         s["enabled"] = False
                     elif "enabled" in d:
                         s["enabled"] = bool(d["enabled"])
-            except Exception:
-                pass
+            except Exception as exc:
+                log(f"manifest discovery failed path={MANIFEST}: {type(exc).__name__}: {exc}")
         for s in sessions:
             if s.get("force_disabled"):
                 s["enabled"] = False
@@ -534,11 +692,8 @@ def main() -> None:
 
             # Auto-start window: from lead time until session end
             if sid not in started and n >= auto_at and n <= end_dt + timedelta(minutes=10):
-                if start_slot(port, s["env_file"]):
+                if start_claimed_session(s):
                     started.add(sid)
-                else:
-                    # retry next ticks
-                    pass
 
             # Peak tracking: session start → +1h, only if bridge is live
             if start_dt <= n <= peak_until:

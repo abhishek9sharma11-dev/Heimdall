@@ -4,10 +4,13 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from dashboard import server
+from dashboard.session_time import normalize_session_time
+from scripts import day_ops_runner as runner
 
 
 class WorkerSlotsRegressionTests(unittest.TestCase):
@@ -47,6 +50,64 @@ class WorkerSlotsRegressionTests(unittest.TestCase):
             ):
                 loaded = server._load_slots()
                 self.assertTrue(any(slot["id"] == "local-slot" for slot in loaded))
+
+    def test_shared_time_parser_rejects_invalid_and_preserves_seconds(self) -> None:
+        self.assertEqual(normalize_session_time("19:20"), "19:20:00")
+        self.assertEqual(normalize_session_time("19:20:35"), "19:20:35")
+        with self.assertRaises(ValueError):
+            normalize_session_time("19:75")
+
+    def test_old_format_registration_is_discoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "today_sessions.json"
+            manifest.write_text(json.dumps({"sessions": [{
+                "id": "86136452840", "meeting_id": "86136452840", "port": 8765,
+                "env_file": ".env.86136452840", "schedule_file": "schedules/86136452840.json",
+                "session_start_ist": "19:20", "session_end_ist": "22:12",
+                "enabled": True, "join_url_present": True,
+            }]}))
+            with patch.object(runner, "MANIFEST", manifest):
+                sessions = runner.load_manifest_sessions()
+            self.assertEqual([s["id"] for s in sessions], ["86136452840"])
+
+    def test_missing_and_malformed_registration_are_logged_and_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.json"
+            with patch.object(runner, "MANIFEST", missing), patch.object(runner, "log") as log:
+                self.assertEqual(runner.load_manifest_sessions(), [])
+                log.assert_called()
+            manifest = Path(tmp) / "bad.json"
+            manifest.write_text(json.dumps({"sessions": [
+                {"id": "bad", "port": 8765, "env_file": ".env.bad", "schedule_file": "bad.json",
+                 "session_start_ist": "not-a-time", "session_end_ist": "22:00"},
+                {"id": "good", "port": 8766, "env_file": ".env.good", "schedule_file": "good.json",
+                 "session_start_ist": "19:20", "session_end_ist": "22:00"},
+            ]}))
+            with patch.object(runner, "MANIFEST", manifest), patch.object(runner, "log") as log:
+                sessions = runner.load_manifest_sessions()
+            self.assertEqual([s["id"] for s in sessions], ["good"])
+            self.assertTrue(any("bad" in call.args[0] and "ValueError" in call.args[0] for call in log.call_args_list))
+
+    def test_lead_time_and_started_or_ended_windows(self) -> None:
+        with patch.object(runner, "now", return_value=datetime(2026, 8, 25, 20, 28, tzinfo=runner.TZ)):
+            start = runner.parse_hhmmss("19:20")
+            end = runner.parse_hhmmss("22:12")
+            self.assertGreaterEqual(runner.now(), start - timedelta(minutes=30))
+            self.assertLessEqual(runner.now(), end)
+        with patch.object(runner, "now", return_value=datetime(2026, 8, 25, 22, 30, tzinfo=runner.TZ)):
+            self.assertGreater(runner.now(), runner.parse_hhmmss("22:12") + timedelta(minutes=10))
+
+    def test_failed_start_releases_claim_and_duplicate_is_blocked(self) -> None:
+        session = {"id": "one", "port": 8765, "env_file": ".env.one"}
+        with patch.object(runner.session_store, "claim", return_value=True), \
+             patch.object(runner.session_store, "release_claim") as release, \
+             patch.object(runner, "start_slot", return_value=False):
+            self.assertFalse(runner.start_claimed_session(session))
+            release.assert_called_once()
+        with patch.object(runner.session_store, "claim", return_value=False), \
+             patch.object(runner, "start_slot") as start:
+            self.assertFalse(runner.start_claimed_session(session))
+            start.assert_not_called()
 
 
 if __name__ == "__main__":

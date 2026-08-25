@@ -25,6 +25,8 @@ from zoneinfo import ZoneInfo
 from . import payments_db
 from .payments_db import format_totals_by_currency
 from .schedule_upload import parse_upload, write_schedule
+from .session_time import normalize_session_time
+from . import session_store
 import subprocess
 import shlex
 import base64
@@ -103,16 +105,7 @@ def _pick_registration_port(meeting_id: str) -> int:
 
 def _time_value(value: str) -> str:
     """Convert an ISO datetime or HH:MM[:SS] value to runner time-of-day."""
-    value = str(value or "").strip()
-    if "T" in value:
-        value = value.split("T", 1)[1]
-    value = value.split("+", 1)[0].split("Z", 1)[0]
-    if not value:
-        return ""
-    parts = value.split(":")
-    if len(parts) == 2:
-        return f"{parts[0]}:{parts[1]}:00"
-    return value[:8]
+    return normalize_session_time(value)
 
 
 def _load_dotenv() -> None:
@@ -1316,6 +1309,11 @@ class Handler(SimpleHTTPRequestHandler):
                         "start_lead_minutes": 30,
                         "source": "dashboard_worker_registration",
                     }
+                    session_store.upsert({
+                        "session": session,
+                        "env_values": env_values,
+                        "schedule": schedule_doc if schedule_path else {},
+                    })
                     sessions.append(session)
                     manifest["date"] = date.today().isoformat()
                     manifest["sessions"] = sessions
