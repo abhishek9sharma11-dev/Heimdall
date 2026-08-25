@@ -1,0 +1,45 @@
+FROM mcr.microsoft.com/playwright:v1.59.1-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /app
+
+# Python + basic utilities
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+COPY requirements-lite.txt .
+RUN python3 -m pip install --no-cache-dir \
+    -r requirements-lite.txt \
+    "psycopg[binary]>=3.1"
+
+# Node bridge dependencies
+COPY bridge/node-bridge/package.json bridge/node-bridge/package-lock.json* ./bridge/node-bridge/
+
+RUN cd bridge/node-bridge && \
+    npm install --omit=dev
+
+# Copy application
+COPY . .
+
+# Render supplies PORT.
+# Hermes dashboard must listen publicly inside the container.
+ENV HERMES_HOST=0.0.0.0
+ENV HERMES_DOCKER=1
+ENV HERMES_WORKER_MODE=1
+
+RUN chmod +x scripts/hermes_build_start.sh \
+    scripts/hermes_slots.sh \
+    scripts/day_ops_runner.py
+
+EXPOSE 8780
+
+CMD ["bash", "scripts/hermes_build_start.sh"]

@@ -48,7 +48,7 @@ _cohorts_lock = threading.Lock()
 _bot_procs_lock = threading.Lock()
 # mapping: session_key -> info dict for either subprocess or docker-launched session
 _bot_procs: dict[str, dict[str, Any]] = {}
-_PLAYWRIGHT_PORTS = tuple(range(8765, 8778))
+_PLAYWRIGHT_PORTS = tuple(range(8765, 8776))
 _zoom_registration_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _ZOOM_REGISTRATION_CACHE_SEC = 300
 _TRACKER_EVAL = r'''var t=(document.body&&document.body.innerText)||'';var a=null;var m=t.match(/Attendees\s*\((\d+)\)/i);if(m)a=parseInt(m[1],10);var p=t.match(/Participants\s*\((\d+)\)/i);return {attendees:a,participants:p?parseInt(p[1],10):null};'''
@@ -72,6 +72,42 @@ def _pick_playwright_port() -> int:
         except (urllib.error.URLError, TimeoutError, OSError):
             return port
     raise RuntimeError('no free Playwright bridge port (8765-8775)')
+
+
+def _pick_registration_port(meeting_id: str) -> int:
+    """Reserve a supported bridge port for a worker-discovered session."""
+    manifest_path = REPO / "schedules" / "today_sessions.json"
+    existing_port = None
+    occupied = set()
+    try:
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        for session in manifest.get("sessions", []):
+            port = session.get("port")
+            if port:
+                occupied.add(int(port))
+            if str(session.get("meeting_id")) == str(meeting_id):
+                existing_port = int(port) if port else None
+    except (OSError, ValueError, TypeError):
+        pass
+    if existing_port in _PLAYWRIGHT_PORTS:
+        return existing_port
+    for port in _PLAYWRIGHT_PORTS:
+        if port in occupied:
+            continue
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.25)
+        except Exception:
+            return port
+    raise RuntimeError("no free Playwright bridge port (8765-8775)")
+
+
+def _time_value(value: str) -> str:
+    """Convert an ISO datetime or HH:MM[:SS] value to runner time-of-day."""
+    value = str(value or "").strip()
+    if "T" in value:
+        value = value.split("T", 1)[1]
+    value = value.split("+", 1)[0].split("Z", 1)[0]
+    return value[:8] if value else ""
 
 
 def _load_dotenv() -> None:
@@ -1200,6 +1236,90 @@ class Handler(SimpleHTTPRequestHandler):
             if not session_key:
                 return self._json(400, {"ok": False, "error": "cannot determine session key"})
 
+            if os.environ.get("HERMES_WORKER_MODE", "0") == "1":
+                safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", session_key)[:40]
+                try:
+                    port = _pick_registration_port(meeting_id or safe_key)
+                    env_filename = f".env.{safe_key}"
+                    env_path = REPO / env_filename
+                    schedule_file = (
+                        str(schedule_path.relative_to(REPO))
+                        if schedule_path
+                        else f"schedules/{meeting_id or safe_key}.json"
+                    )
+                    token = parse_qs(urlparse(meeting_join_url).query).get("tk", [""])[0]
+                    start_ist = _time_value(webinar_start_at)
+                    end_ist = _time_value(webinar_end_at)
+                    if schedule_path:
+                        schedule_doc = _load_schedule(schedule_file)
+                        start_ist = start_ist or str(schedule_doc.get("session_start_ist") or "")
+                        end_ist = end_ist or str(schedule_doc.get("session_end_ist") or "")
+                    if not start_ist or not end_ist:
+                        return self._json(400, {"ok": False, "error": "webinar start and end times required"})
+
+                    env_values = {
+                        "MEETING_JOIN_URL": meeting_join_url,
+                        "MEETING_ID": meeting_id,
+                        "BRIDGE_PORT": str(port),
+                        "BRIDGE_URL": f"http://127.0.0.1:{port}",
+                        "MEETING_WEBINAR_TOKEN": token,
+                        "SCHEDULE_FILE": schedule_file,
+                        "WEBINAR_START_AT": webinar_start_at or f"{date.today().isoformat()}T{start_ist}",
+                        "WEBINAR_END_AT": webinar_end_at or f"{date.today().isoformat()}T{end_ist}",
+                        "WEBINAR_JOIN_LEAD_MINUTES": "30",
+                    }
+                    if payment_link_ids:
+                        env_values["PAYMENT_LINK_IDS"] = payment_link_ids
+                    env_path.write_text(
+                        "\n".join(f"{key}={value}" for key, value in env_values.items()) + "\n",
+                        encoding="utf-8",
+                    )
+
+                    manifest_path = REPO / "schedules" / "today_sessions.json"
+                    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                    manifest = (
+                        json.loads(manifest_path.read_text(encoding="utf-8"))
+                        if manifest_path.exists()
+                        else {}
+                    )
+                    sessions = [
+                        entry for entry in manifest.get("sessions", [])
+                        if str(entry.get("meeting_id")) != str(meeting_id)
+                    ]
+                    session = {
+                        "id": meeting_id or safe_key,
+                        "session": meeting_id or safe_key,
+                        "meeting_id": meeting_id,
+                        "port": port,
+                        "env_file": env_filename,
+                        "schedule_file": schedule_file,
+                        "session_start_ist": start_ist,
+                        "session_end_ist": end_ist,
+                        "join_url_present": bool(meeting_join_url),
+                        "enabled": True,
+                        "peak_window_minutes": 60,
+                        "start_lead_minutes": 30,
+                        "source": "dashboard_worker_registration",
+                    }
+                    sessions.append(session)
+                    manifest["date"] = date.today().isoformat()
+                    manifest["sessions"] = sessions
+                    manifest_path.write_text(
+                        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8",
+                    )
+                except Exception as e:
+                    return self._json(500, {"ok": False, "error": f"registration failed: {e}"})
+                return self._json(200, {
+                    "ok": True,
+                    "registered": True,
+                    "worker_mode": True,
+                    "session_key": session_key,
+                    "port": port,
+                    "env_file": env_filename,
+                    "schedule_file": schedule_file,
+                })
+
             # Playwright is the safe/default production path. Docker/C++ is opt-in
             # from the current dashboard checkbox, including for older clients that
             # omit the field entirely.
@@ -1344,10 +1464,14 @@ class Handler(SimpleHTTPRequestHandler):
                     env['SCHEDULE_TZ'] = 'Asia/Kolkata'
 
                 default_python = REPO / '.venv' / 'bin' / 'python'
-                python_value = env.get('PYTHON') or (
-                    str(default_python) if default_python.exists() else sys.executable
-                )
-                python_cmd = shlex.split(python_value)
+                if env.get('PYTHON'):
+                    python_cmd = shlex.split(env['PYTHON'])
+                elif default_python.exists():
+                    # Keep the repository path as one argv item; this workspace
+                    # contains a space in its directory name.
+                    python_cmd = [str(default_python)]
+                else:
+                    python_cmd = [sys.executable]
                 cmd = python_cmd + ['-m', 'src.main']
                 try:
                     proc = subprocess.Popen(cmd, env=env, cwd=str(REPO))
