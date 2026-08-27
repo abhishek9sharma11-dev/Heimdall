@@ -12,7 +12,9 @@ import asyncio
 import logging
 import signal
 import sys
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 from .config import settings
 from .handlers import ChatHandler, Greeter, MessageScheduler, SlashCommands
@@ -25,6 +27,46 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+async def _wait_for_webinar_join(log: logging.Logger) -> None:
+    raw = (settings.webinar_start_at or "").strip()
+    if not raw:
+        log.warning("WEBINAR_START_AT not set; joining immediately")
+        return
+    try:
+        start = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=ZoneInfo(settings.schedule_tz))
+        join_at = start - timedelta(minutes=settings.webinar_join_lead_minutes)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            "WEBINAR_START_AT must be ISO datetime, e.g. 2026-08-16T19:00:00"
+        ) from e
+    delay = (join_at - datetime.now(start.tzinfo)).total_seconds()
+    if delay <= 0:
+        log.info("webinar join time has arrived; joining now")
+        return
+    log.info("webinar starts at %s; waiting %.0f minutes to join", start.isoformat(), delay / 60)
+    await asyncio.sleep(delay)
+
+
+async def _wait_for_webinar_end(log: logging.Logger, stop: asyncio.Event) -> None:
+    raw = (settings.webinar_end_at or "").strip()
+    if not raw:
+        return
+    try:
+        end = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=ZoneInfo(settings.schedule_tz))
+    except (ValueError, TypeError):
+        log.error("WEBINAR_END_AT must be ISO datetime, e.g. 2026-08-16T17:37:00")
+        return
+    delay = (end - datetime.now(end.tzinfo)).total_seconds()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    log.info("webinar end time reached; leaving Zoom and stopping reconnects")
+    stop.set()
 
 
 async def main() -> int:
@@ -67,12 +109,11 @@ async def main() -> int:
         for h in ("127.0.0.1", "localhost", "0.0.0.0")
     )
     if settings.answer_questions and not settings.openrouter_api_key and not _local:
-        print(
-            "ERROR: OPENROUTER_API_KEY not set (required for remote LLM). "
-            "Or set OPENROUTER_BASE_URL=http://127.0.0.1:11434/v1 for local Ollama.",
-            file=sys.stderr,
+        log.warning(
+            "OPENROUTER_API_KEY not set; joining with AI answers disabled. "
+            "Scheduled chat still runs. Set the key to enable answers."
         )
-        return 1
+        settings.answer_questions = False
 
     client = make_client()
     scheduler = MessageScheduler(client)
@@ -108,7 +149,9 @@ async def main() -> int:
             pass  # Windows
 
     try:
+        await _wait_for_webinar_join(log)
         await client.join(settings.meeting_id, settings.meeting_password)
+        await client.wait_until_ready()
     except Exception as e:
         log.exception("failed to join meeting: %s", e)
         return 2
@@ -125,6 +168,7 @@ async def main() -> int:
 
     sched_task = asyncio.create_task(scheduler.run())
     run_task = asyncio.create_task(client.run())
+    end_task = asyncio.create_task(_wait_for_webinar_end(log, stop))
 
     try:
         # Run until either the client exits or we get a signal
@@ -134,6 +178,7 @@ async def main() -> int:
         )
     finally:
         sched_task.cancel()
+        end_task.cancel()
         run_task.cancel()
         try:
             await client.leave()
