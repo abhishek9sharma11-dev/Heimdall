@@ -122,15 +122,20 @@ start_port() {
   echo "Bridge OK (pid $(cat "$PIDDIR/bridge-${p}.pid"))"
 
   echo "Starting python with $(basename "$envpath") …"
-  nohup bash -lc "
-    cd '$ROOT'
-    set -a
-    source '$ROOT/.venv/bin/activate'
-    source '$envpath'
-    set +a
-    export ZOOM_BACKEND=bridge
-    exec python -m src.main
-  " >>"/tmp/python-${p}.log" 2>&1 &
+  PYTHON_BIN="${PYTHON:-python3}"
+
+if [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT/.venv/bin/python"
+fi
+
+nohup bash -lc "
+  cd '$ROOT'
+  set -a
+  source '$envpath'
+  set +a
+  export ZOOM_BACKEND=bridge
+  exec '$PYTHON_BIN' -m src.main
+" >>"/tmp/python-${p}.log" 2>&1 &
   echo $! >"$PIDDIR/python-${p}.pid"
   echo "Python OK (pid $(cat "$PIDDIR/python-${p}.pid")) → /tmp/python-${p}.log"
 }
