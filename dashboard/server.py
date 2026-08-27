@@ -1333,6 +1333,24 @@ class Handler(SimpleHTTPRequestHandler):
                         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
                         encoding="utf-8",
                     )
+
+                    # A registration made while the webinar is already live
+                    # should connect immediately; the background watcher still
+                    # handles future sessions and retries.
+                    if not _bridge_health(port).get("online"):
+                        launch = subprocess.run(
+                            [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), env_filename],
+                            cwd=str(REPO),
+                            capture_output=True,
+                            text=True,
+                            timeout=45,
+                        )
+                        if launch.returncode != 0:
+                            detail = ((launch.stdout or "") + "\n" + (launch.stderr or "")).strip()
+                            return self._json(500, {
+                                "ok": False,
+                                "error": f"worker launch failed: {detail[-1000:]}",
+                            })
                 except Exception as e:
                     return self._json(500, {"ok": False, "error": f"registration failed: {e}"})
                 return self._json(200, {
