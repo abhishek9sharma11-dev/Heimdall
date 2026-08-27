@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Day ops: auto-start webinar stacks 30 min before start; track peak attendees;
-auto-sync Peak/Retention/INR/USD/Total Payments into Workshops Tracking after
-session_end (+ grace).
+deliver a completed-session report to Slack, then remove transient session state.
 
 Reads schedules/today_sessions.json. For each enabled session:
   - At (session_start - start_lead_minutes): start bridge+python via hermes_slots.sh
   - For first peak_window_minutes after session_start: poll participant counts every 10s
   - At first payment-link drop: snapshot attendees (retention)
-  - At session_end + 5 min: write metrics to Google Sheet Tracking tab
+  - At session_end + 5 min: deliver the report to Slack and clean up
 
 Does not stop other sessions. Safe to leave running all day.
 """
@@ -16,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import socket
 import subprocess
 import time
 import sys
@@ -37,7 +35,6 @@ except ModuleNotFoundError:
     from slack_reporting import finalize_report, metric_row
 
 from dashboard.session_time import normalize_session_time
-from dashboard import session_store
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "schedules" / "today_sessions.json"
@@ -50,11 +47,10 @@ TZ = ZoneInfo("Asia/Kolkata")
 TICK_SEC = 5
 PEAK_INTERVAL = 10
 DAILY_MD_INTERVAL = 60
-# Wait a few minutes after session_end so late payments can land, then write Tracking.
+# Wait a few minutes after session_end so late payments can land before reporting.
 SHEET_SYNC_GRACE_MIN = 5
 SLACK_REPORT_OUT = Path("/tmp/hermes-slack-reports.json")
 PAYMENT_LINK_RE = re.compile(r"https?://link\.outskill\.com/[^\s<>\"']+", re.I)
-WORKER_OWNER = f"{socket.gethostname()}:{os.getpid()}"
 
 EVAL = r"""
 var text = (document.body && document.body.innerText) || '';
@@ -143,61 +139,6 @@ def _env_values(path: Path) -> dict[str, str]:
     return values
 
 
-def materialize_persistent_registrations() -> None:
-    """Rebuild runtime files from DB records after Render restarts."""
-    if not session_store.configured():
-        return
-    records = session_store.list_records()
-    try:
-        manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
-    except Exception:
-        manifest = {}
-    entries = [x for x in manifest.get("sessions") or [] if isinstance(x, dict)]
-    by_id = {str(x.get("id") or x.get("meeting_id")): x for x in entries}
-    changed = False
-    for record in records:
-        entry = record.get("session") or {}
-        sid = str(entry.get("id") or entry.get("meeting_id") or "")
-        if not sid:
-            continue
-        env_values = record.get("env_values") or {}
-        env_file = ROOT / str(entry.get("env_file") or "")
-        if env_values and not env_file.exists():
-            env_file.write_text(
-                "\n".join(f"{k}={v}" for k, v in env_values.items()) + "\n",
-                encoding="utf-8",
-            )
-        schedule = record.get("schedule") or {}
-        schedule_file = ROOT / str(entry.get("schedule_file") or "")
-        if schedule and not schedule_file.exists():
-            schedule_file.parent.mkdir(parents=True, exist_ok=True)
-            schedule_file.write_text(json.dumps(schedule, indent=2) + "\n", encoding="utf-8")
-        if sid not in by_id:
-            entries.append(entry)
-            by_id[sid] = entry
-            changed = True
-    if changed:
-        manifest["sessions"] = entries
-        manifest["date"] = manifest.get("date") or now().date().isoformat()
-        MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-        MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def import_legacy_registrations() -> None:
-    """Adopt a pre-database manifest once, preserving old HH:MM registrations."""
-    if not session_store.configured() or not MANIFEST.exists():
-        return
-    for entry in load_manifest_sessions():
-        sid = str(entry.get("id") or "")
-        env_values = _env_values(ROOT / str(entry["env_file"]))
-        schedule_path = ROOT / str(entry["schedule_file"])
-        try:
-            schedule = json.loads(schedule_path.read_text()) if schedule_path.exists() else {}
-            session_store.upsert({"session": entry, "env_values": env_values, "schedule": schedule})
-        except Exception as exc:
-            log(f"registration adoption failed session {sid} path={schedule_path}: {type(exc).__name__}: {exc}")
-
-
 def health(port: int) -> dict:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as r:
@@ -249,19 +190,6 @@ def save_pay_drops(data: dict) -> None:
     PAY_DROP_OUT.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def load_sheet_sync() -> dict:
-    if SHEET_SYNC_OUT.exists():
-        try:
-            return json.loads(SHEET_SYNC_OUT.read_text())
-        except Exception:
-            pass
-    return {"updated_at": None, "sessions": {}}
-
-
-def save_sheet_sync(data: dict) -> None:
-    SHEET_SYNC_OUT.write_text(json.dumps(data, indent=2) + "\n")
-
-
 def load_slack_reports() -> dict:
     if SLACK_REPORT_OUT.exists():
         try:
@@ -273,31 +201,6 @@ def load_slack_reports() -> dict:
 
 def save_slack_reports(data: dict) -> None:
     SLACK_REPORT_OUT.write_text(json.dumps(data, indent=2) + "\n")
-
-
-def sync_tracking_sheet(session_id: str) -> tuple[bool, str]:
-    """Write Peak/Retention/INR/USD/Total Payments into Workshops Tracking."""
-    try:
-        r = subprocess.run(
-            [
-                sys.executable,
-                str(ROOT / "scripts/sync_tracking_sheet.py"),
-                "--session",
-                session_id,
-                "--auto",
-                "--ensure-row",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-    except Exception as e:
-        return False, f"sync launch error: {e}"
-    out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
-    if r.returncode != 0:
-        return False, out[-500:] or f"exit {r.returncode}"
-    return True, out[-500:]
 
 
 def first_payment_from_schedule(path: Path) -> dict | None:
@@ -406,6 +309,58 @@ def persist_force_disable(session_id: str) -> None:
         log(f"WARN could not persist force_disabled for {session_id}: {e}")
 
 
+def forget_session(session: dict, report_files: list[str]) -> None:
+    """Delete transient runtime state after a successful Slack delivery."""
+    session_id = str(session.get("id") or "")
+    meeting_id = str(session.get("meeting_id") or "")
+    identifiers = {session_id, meeting_id}
+
+    for raw in report_files:
+        try:
+            Path(raw).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    for path, collection in (
+        (PEAK_OUT, "slots"),
+        (PAY_DROP_OUT, "sessions"),
+        (SHEET_SYNC_OUT, "sessions"),
+    ):
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+            values = data.get(collection) or {}
+            data[collection] = {
+                key: value for key, value in values.items()
+                if str(value.get("id") or value.get("session_id") or "") not in identifiers
+                and str(value.get("meeting_id") or "") != meeting_id
+            }
+            path.write_text(json.dumps(data, indent=2) + "\n")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    try:
+        manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
+        manifest["sessions"] = [
+            value for value in manifest.get("sessions") or []
+            if str(value.get("id") or value.get("meeting_id") or "") not in identifiers
+        ]
+        MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    for raw in (session.get("env_file"), session.get("schedule_file")):
+        if not raw:
+            continue
+        path = ROOT / str(raw)
+        if path.name == MANIFEST.name:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    log(f"forgot transient session {session_id}")
+
+
 def start_slot(port: int, env_file: str) -> bool:
     h = health(port)
     state = h.get("meeting_state")
@@ -446,39 +401,6 @@ def start_slot(port: int, env_file: str) -> bool:
         log(f"start FAILED :{port}: {r.stdout[-400:]} {r.stderr[-400:]}")
         return False
     log(f"start OK :{port}: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'ok'}")
-    return True
-
-
-def claim_for_start(session_id: str) -> bool:
-    try:
-        claimed = session_store.claim(session_id, WORKER_OWNER)
-    except Exception as exc:
-        log(f"claim failed session {session_id}: {type(exc).__name__}: {exc}")
-        return False
-    if not claimed:
-        log(f"skip start session {session_id}: already claimed or running")
-    return claimed
-
-
-def release_start_claim(session_id: str) -> None:
-    try:
-        session_store.release_claim(session_id, WORKER_OWNER)
-    except Exception as exc:
-        log(f"claim release failed session {session_id}: {type(exc).__name__}: {exc}")
-
-
-def start_claimed_session(session: dict) -> bool:
-    """Claim, start, and persist ownership; release the claim on startup failure."""
-    sid = str(session["id"])
-    if not claim_for_start(sid):
-        return False
-    if not start_slot(int(session["port"]), session["env_file"]):
-        release_start_claim(sid)
-        return False
-    try:
-        session_store.mark_running(sid, WORKER_OWNER)
-    except Exception as exc:
-        log(f"running-state update failed session {sid}: {type(exc).__name__}: {exc}")
     return True
 
 
@@ -545,17 +467,11 @@ def try_fill_missing_join_from_excel(sessions: list[dict]) -> None:
 
 
 def main() -> None:
-    try:
-        import_legacy_registrations()
-        materialize_persistent_registrations()
-    except Exception as exc:
-        log(f"persistent registration sync failed: {type(exc).__name__}: {exc}")
     sessions = load_manifest_sessions()
     started: set[str] = set()
     last_peak_at: dict[str, float] = {}
     peak = load_peak()
     pay = load_pay_drops()
-    sheet_sync = load_sheet_sync()
     slack_reports = load_slack_reports()
     first_pay: dict[str, dict] = {}
     last_daily_md = 0.0
@@ -603,11 +519,6 @@ def main() -> None:
             # or the dashboard Connect form) so a long-lived `npm run build`
             # process doesn't need a restart to pick up new webinars.
             try:
-                try:
-                    import_legacy_registrations()
-                    materialize_persistent_registrations()
-                except Exception as exc:
-                    log(f"persistent discovery failed path={MANIFEST}: {type(exc).__name__}: {exc}")
                 disk = load_manifest_sessions()
                 by_id = {str(x.get("id")): x for x in disk}
                 known_ids = {s["id"] for s in sessions}
@@ -692,7 +603,7 @@ def main() -> None:
 
             # Auto-start window: from lead time until session end
             if sid not in started and n >= auto_at and n <= end_dt + timedelta(minutes=10):
-                if start_claimed_session(s):
+                if start_slot(port, s["env_file"]):
                     started.add(sid)
 
             # Peak tracking: session start → +1h, only if bridge is live
@@ -754,44 +665,8 @@ def main() -> None:
                         c = eval_counts(port)
                         capture_payment_drop(s, fp, c, pay)
 
-            # End-of-session → auto-write Tracking sheet (Peak / Retention / INR / USD / Total)
+            # End-of-session → deliver to Slack, then forget all runtime state.
             sync_at = end_dt + timedelta(minutes=SHEET_SYNC_GRACE_MIN)
-            prior = (sheet_sync.get("sessions") or {}).get(sid) or {}
-            already = bool(prior.get("ok")) and prior.get("date") == n.strftime("%Y-%m-%d")
-            last_try = prior.get("synced_at")
-            recently_tried = False
-            if last_try and prior.get("date") == n.strftime("%Y-%m-%d"):
-                try:
-                    recently_tried = (
-                        n - datetime.fromisoformat(last_try)
-                    ).total_seconds() < 300
-                except Exception:
-                    recently_tried = False
-            if (
-                sid in started
-                and not already
-                and not recently_tried
-                and n >= sync_at
-                and n <= end_dt + timedelta(minutes=120)
-            ):
-                ok, detail = sync_tracking_sheet(sid)
-                entry = {
-                    "session_id": sid,
-                    "meeting_id": s.get("meeting_id"),
-                    "port": port,
-                    "date": n.strftime("%Y-%m-%d"),
-                    "synced_at": n.isoformat(),
-                    "ok": ok,
-                    "detail": detail[-400:],
-                }
-                sheet_sync.setdefault("sessions", {})[sid] = entry
-                sheet_sync["updated_at"] = n.isoformat()
-                save_sheet_sync(sheet_sync)
-                if ok:
-                    log(f"sheet_sync OK {sid} :{port} — Tracking updated")
-                else:
-                    log(f"sheet_sync FAILED {sid} :{port}: {detail[-200:]}")
-
             report_key = f"{n.strftime('%Y-%m-%d')}:{sid}"
             report_status = (slack_reports.get("sessions") or {}).get(report_key) or {}
             if (
@@ -803,22 +678,28 @@ def main() -> None:
                 peak_row = metric_row(peak, s.get("meeting_id"), payment=False)
                 payment_row = metric_row(pay, s.get("meeting_id"), payment=True)
                 try:
-                    result = finalize_report(s, peak_row, payment_row, prior)
+                    result = finalize_report(s, peak_row, payment_row, {})
                     delivery = result.get("delivery") or {}
-                    report_status = {
-                        "completed": True,
-                        "date": n.strftime("%Y-%m-%d"),
-                        "report_files": result.get("report_files") or [],
-                        "slack_ok": bool(delivery.get("ok")),
-                        "slack_error": delivery.get("error") or delivery.get("skipped"),
-                        "sent_at": n.isoformat(),
-                    }
-                    slack_reports.setdefault("sessions", {})[report_key] = report_status
-                    save_slack_reports(slack_reports)
                     if delivery.get("ok"):
                         log(f"slack_report OK {sid} :{port}")
+                        subprocess.run([str(HERMES), "stop", str(port)], cwd=str(ROOT), check=False)
+                        forget_session(s, result.get("report_files") or [])
+                        started.discard(sid)
+                        sessions[:] = [item for item in sessions if str(item.get("id")) != sid]
+                        first_pay.pop(sid, None)
+                        slack_reports.setdefault("sessions", {}).pop(report_key, None)
+                        save_slack_reports(slack_reports)
                     else:
-                        log(f"slack_report skipped/failed {sid} :{port} — finalization continued")
+                        report_status = {
+                            "completed": False,
+                            "date": n.strftime("%Y-%m-%d"),
+                            "slack_ok": False,
+                            "slack_error": delivery.get("error") or delivery.get("skipped"),
+                            "last_attempt_at": n.isoformat(),
+                        }
+                        slack_reports.setdefault("sessions", {})[report_key] = report_status
+                        save_slack_reports(slack_reports)
+                        log(f"slack_report skipped/failed {sid} :{port} — retaining state for retry")
                 except Exception as e:
                     log(f"slack_report failed {sid} :{port} — finalization continued: {type(e).__name__}")
 

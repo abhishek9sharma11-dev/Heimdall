@@ -9,7 +9,7 @@
 </head>
 <body>
   <h1 style="font-size:20px;margin-bottom:8px">Register Webinar Session</h1>
-  <p style="color:#9ca3af;margin-bottom:12px">Enter webinar details and optionally upload a schedule. In worker mode this registers the session for the persistent worker; it does not start Zoom from the dashboard.</p>
+  <p style="color:#9ca3af;margin-bottom:12px">Enter webinar details and optionally upload a schedule. The worker keeps this only for the active session, then sends the report to Slack and removes the runtime data.</p>
 
   <form id="connect-form">
     <label style="display:block;margin-bottom:8px">

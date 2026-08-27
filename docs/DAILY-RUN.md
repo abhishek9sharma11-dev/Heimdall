@@ -13,7 +13,7 @@ Works for **any** workshop set: load sessions → auto-start → chats fire → 
 | **Chat drops** | `chat_drops` | each scheduled `text` row | Scheduler fires + daily report |
 | **Peak attendees** | `peak_attendees` / Peak Showup | first **60 min** after `session_start_ist`, poll every **10s** | `day_ops_runner` → `/tmp/hermes-peak-attendees.json` |
 | **Payment link drop attendees** | `payment_link_drop_attendees_count` / Retention | first chat containing `link.outskill.com` | Scheduler + `day_ops_runner` → `/tmp/hermes-payment-drop-attendees.json` |
-| **Payments (INR / USD / Total)** | Tracking E–G | after `session_end` + **5 min** | `day_ops_runner` → `scripts/sync_tracking_sheet.py --auto` → Workshops **Tracking** tab |
+| **Session report** | Slack channel | after `session_end` + **5 min** | `day_ops_runner` → Slack CSV/XLSX report; transient session files are then removed |
 
 Live day file columns always include: session, meeting id, port, start, bridge state, chat planned/fired, peak (footer/attendees/participants), payment-drop time + attendees count + URL.
 
@@ -47,7 +47,7 @@ nohup .venv/bin/python scripts/day_ops_runner.py >> /tmp/day-ops-runner.log 2>&1
 | `schedules/today_sessions.json` | Today's session manifest (ports, starts, envs) |
 | `/tmp/hermes-peak-attendees.json` | Raw peak samples |
 | `/tmp/hermes-payment-drop-attendees.json` | Payment-drop attendees |
-| `/tmp/hermes-sheet-sync.json` | End-of-session Tracking sheet sync status |
+| `/tmp/hermes-slack-reports.json` | Temporary Slack delivery retry status |
 | `/tmp/hermes-chat-drops.json` | Scheduled chat fire log |
 | `/tmp/day-ops-runner.log` | Ops runner log |
 
@@ -58,7 +58,7 @@ nohup .venv/bin/python scripts/day_ops_runner.py >> /tmp/day-ops-runner.log 2>&1
 - Auto-start lead: **30 minutes** before `session_start_ist` (`Asia/Kolkata`).
 - Peak window: **60 minutes** from session start, sample every **10 seconds**.
 - Payment-drop count: snapshot once at first `link.outskill.com` message (±90s via day-ops; exact on scheduler send).
-- Tracking sheet sync: **session_end + 5 minutes** → Peak Showup, Retention, INR count, USD count, Total Payments (creates the Date+Workshop row if missing).
+- Slack report: **session_end + 5 minutes** → Peak Showup, Retention, payment-drop retention, and session details; runtime state is removed only after successful delivery.
 - **AI for Students** sessions write to the **AI for Students Tracking** tab (same Workshops Google Sheet) — one new row per day per Day-1 / Day-2; older rows are never changed.
 - Display name must contain `AI`. Prefer `ANSWER_QUESTIONS=false` for schedule-only simulive.
 - Never `pkill -f 'python -m src.main'` — kill by port / PID only.

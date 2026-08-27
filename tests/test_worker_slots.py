@@ -22,7 +22,7 @@ class WorkerSlotsRegressionTests(unittest.TestCase):
     def test_worker_missing_slots_returns_empty_and_status_is_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "slots.json"
-            with patch.object(server, "SLOTS_PATH", missing), patch.dict(
+            with patch.object(server, "SLOTS_PATH", missing), patch.object(server, "REPO", Path(tmp)), patch.dict(
                 os.environ, {"HERMES_WORKER_MODE": "1"}, clear=False
             ):
                 self.assertEqual(server._load_slots(), [])
@@ -97,17 +97,11 @@ class WorkerSlotsRegressionTests(unittest.TestCase):
         with patch.object(runner, "now", return_value=datetime(2026, 8, 25, 22, 30, tzinfo=runner.TZ)):
             self.assertGreater(runner.now(), runner.parse_hhmmss("22:12") + timedelta(minutes=10))
 
-    def test_failed_start_releases_claim_and_duplicate_is_blocked(self) -> None:
+    def test_failed_start_is_retried_by_runtime_worker(self) -> None:
         session = {"id": "one", "port": 8765, "env_file": ".env.one"}
-        with patch.object(runner.session_store, "claim", return_value=True), \
-             patch.object(runner.session_store, "release_claim") as release, \
-             patch.object(runner, "start_slot", return_value=False):
-            self.assertFalse(runner.start_claimed_session(session))
-            release.assert_called_once()
-        with patch.object(runner.session_store, "claim", return_value=False), \
-             patch.object(runner, "start_slot") as start:
-            self.assertFalse(runner.start_claimed_session(session))
-            start.assert_not_called()
+        with patch.object(runner, "start_slot", return_value=False) as start:
+            self.assertFalse(runner.start_slot(session["port"], session["env_file"]))
+            start.assert_called_once_with(8765, ".env.one")
 
 
 if __name__ == "__main__":

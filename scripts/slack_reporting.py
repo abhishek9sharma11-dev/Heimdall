@@ -65,7 +65,6 @@ def report_row(
         "peak_participants": str(peak.get("peak_participants") or ""),
         "retention_at_payment_drop": str(payment.get("attendees_count") or ""),
         "payment_drop_time": str(payment.get("schedule_time") or ""),
-        "sheet_sync": "ok" if sheet_sync.get("ok") else ("failed" if sheet_sync else "not_attempted"),
     }
 
 
@@ -158,7 +157,7 @@ def slack_payloads(
         f"Meeting ID: {row['meeting_id']}\n"
         f"Peak attendees: {row['peak_attendees'] or '—'} | "
         f"Retention: {row['retention_at_payment_drop'] or '—'}\n"
-        f"Sheet sync: {row['sheet_sync']}"
+        ""
     )
     return {
         "channel": channel,

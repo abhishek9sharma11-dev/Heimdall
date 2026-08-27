@@ -26,7 +26,6 @@ from . import payments_db
 from .payments_db import format_totals_by_currency
 from .schedule_upload import parse_upload, write_schedule
 from .session_time import normalize_session_time
-from . import session_store
 import subprocess
 import shlex
 import base64
@@ -125,9 +124,27 @@ def _load_dotenv() -> None:
 
 def _load_slots() -> list[dict[str, Any]]:
     if not SLOTS_PATH.exists() and os.environ.get("HERMES_WORKER_MODE", "0") == "1":
-        # Production worker registrations live in today_sessions.json.  The
-        # local slots file is intentionally not required or synthesized here.
-        return []
+        # Production worker registrations live in today_sessions.json.  Render
+        # does not ship a static slots.json, so expose the runtime manifest as
+        # dashboard slots instead of reporting an empty dashboard.
+        manifest_path = REPO / "schedules" / "today_sessions.json"
+        try:
+            manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        return [
+            {
+                **entry,
+                "account": entry.get("account") or "Worker",
+                "mode": entry.get("mode") or "simulive",
+                "icon": entry.get("icon") or "videocam",
+            }
+            for entry in (manifest.get("sessions") or [])
+            if isinstance(entry, dict)
+            and entry.get("meeting_id")
+            and entry.get("port")
+            and entry.get("enabled") is not False
+        ]
     slots = json.loads(SLOTS_PATH.read_text())
     out: list[dict[str, Any]] = []
     for s in slots:
@@ -1309,11 +1326,6 @@ class Handler(SimpleHTTPRequestHandler):
                         "start_lead_minutes": 30,
                         "source": "dashboard_worker_registration",
                     }
-                    session_store.upsert({
-                        "session": session,
-                        "env_values": env_values,
-                        "schedule": schedule_doc if schedule_path else {},
-                    })
                     sessions.append(session)
                     manifest["date"] = date.today().isoformat()
                     manifest["sessions"] = sessions
