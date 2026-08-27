@@ -108,9 +108,14 @@ start_port() {
   echo "Starting bridge :${p} …"
   (
     cd "$ROOT/bridge/node-bridge"
-    # Cursor agent shells often set PLAYWRIGHT_BROWSERS_PATH to a sandbox cache
-    # that points at the wrong CPU arch; prefer system Chrome / default cache.
-    unset PLAYWRIGHT_BROWSERS_PATH
+    # Render's Playwright image installs Chromium under /ms-playwright. Local
+    # runs may have a machine-specific cache, so only force the image path in
+    # the container runtime.
+    if [[ "${HERMES_DOCKER:-0}" == "1" ]]; then
+      export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright}"
+    else
+      unset PLAYWRIGHT_BROWSERS_PATH
+    fi
     nohup env BRIDGE_PORT="$p" node index.js >>"/tmp/node-bridge-${p}.log" 2>&1 &
     echo $! >"$PIDDIR/bridge-${p}.pid"
   )
