@@ -52,6 +52,7 @@ _bot_procs_lock = threading.Lock()
 _bot_procs: dict[str, dict[str, Any]] = {}
 _worker_sessions: dict[str, dict[str, Any]] = {}
 _worker_sessions_lock = threading.Lock()
+_worker_supervisor_error: str | None = None
 _PLAYWRIGHT_PORTS = tuple(range(8765, 8776))
 _zoom_registration_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _ZOOM_REGISTRATION_CACHE_SEC = 300
@@ -436,6 +437,10 @@ def _bridge_health(port: int) -> dict[str, Any]:
                 "meeting_state": data.get("meeting_state", "unknown"),
                 "has_page": bool(data.get("has_page")),
                 "reconnecting": bool(data.get("reconnecting")),
+                "joining": bool(data.get("joining")),
+                "last_join_error": data.get("last_join_error"),
+                "join_started_at": data.get("join_started_at"),
+                "last_join_finished_at": data.get("last_join_finished_at"),
             }
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return {
@@ -444,35 +449,46 @@ def _bridge_health(port: int) -> dict[str, Any]:
             "meeting_state": "offline",
             "has_page": False,
             "reconnecting": False,
+            "joining": False,
+            "last_join_error": "bridge unreachable",
         }
 
 
 def _worker_supervisor() -> None:
     """Keep live Render worker bridges connected after the initial join."""
+    global _worker_supervisor_error
     while True:
         try:
             with _worker_sessions_lock:
                 sessions = list(_worker_sessions.values())
             for session in sessions:
-                port = int(session["port"])
-                health = _bridge_health(port)
-                if health.get("meeting_state") in {"in_meeting", "waiting"}:
-                    continue
-                if health.get("meeting_state") == "joining" and health.get("has_page"):
-                    continue
-                if not health.get("online"):
-                    subprocess.run(
-                        [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), session["env_file"]],
-                        cwd=str(REPO), capture_output=True, text=True, timeout=60,
+                try:
+                    port = int(session["port"])
+                    health = _bridge_health(port)
+                    if health.get("meeting_state") in {"in_meeting", "waiting"}:
+                        continue
+                    if health.get("meeting_state") == "joining" and health.get("has_page"):
+                        continue
+                    if not health.get("online"):
+                        launch = subprocess.run(
+                            [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), session["env_file"]],
+                            cwd=str(REPO), capture_output=True, text=True, timeout=60,
+                        )
+                        if launch.returncode != 0:
+                            raise RuntimeError((launch.stderr or launch.stdout or "bridge start failed")[-500:])
+                    join_req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/join",
+                        data=json.dumps(session["join_payload"]).encode(),
+                        headers={"Content-Type": "application/json"}, method="POST",
                     )
-                join_req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/join",
-                    data=json.dumps(session["join_payload"]).encode(),
-                    headers={"Content-Type": "application/json"}, method="POST",
-                )
-                urllib.request.urlopen(join_req, timeout=10).close()
-        except Exception:
-            pass
+                    urllib.request.urlopen(join_req, timeout=10).close()
+                    _worker_supervisor_error = None
+                except Exception as exc:
+                    _worker_supervisor_error = str(exc)
+                    print(f"worker supervisor: session recovery failed: {exc}", flush=True)
+        except Exception as exc:
+            _worker_supervisor_error = str(exc)
+            print(f"worker supervisor: {exc}", flush=True)
         time.sleep(5)
 
 
@@ -962,6 +978,21 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(200, {
                 "status": "ok",
                 "worker_mode": os.environ.get("HERMES_WORKER_MODE", "0") == "1",
+            })
+
+        if path == "/api/worker/health":
+            # Safe diagnostics only: never return the join URL or webinar token.
+            with _worker_sessions_lock:
+                sessions = list(_worker_sessions.items())
+            workers = []
+            for session_key, session in sessions:
+                health = _bridge_health(int(session["port"]))
+                workers.append({"session_key": session_key, "port": session["port"], **health})
+            return self._json(200, {
+                "ok": True,
+                "poll_interval_seconds": 5,
+                "supervisor_error": _worker_supervisor_error,
+                "workers": workers,
             })
 
         if path == "/api/status":

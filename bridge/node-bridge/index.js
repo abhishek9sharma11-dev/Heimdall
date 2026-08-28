@@ -29,7 +29,22 @@ let joining = false;
 let reconnecting = false;
 let lastJoin = null; // {meeting_id, password, display_name, webinar_token, join_url}
 let meetingState = 'idle'; // idle|joining|preview|waiting|in_meeting|signin|disconnected
+let lastJoinError = null;
+let joinStartedAt = null;
+let lastJoinFinishedAt = null;
 let watchdog = null;
+// "unknown" is the fallback for a page that hasn't finished loading yet (a fresh
+// navigation is briefly blank), not just for genuine failures — require it to
+// persist across a few watchdog ticks before treating it as broken.
+let unknownStreak = 0;
+const UNKNOWN_STREAK_THRESHOLD = 3;
+
+function pastBridgeEnd() {
+  const raw = process.env.BRIDGE_END_AT || '';
+  if (!raw) return false;
+  const end = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T'));
+  return Number.isFinite(end) && Date.now() >= end;
+}
 
 // ---- SSE helpers --------------------------------------------------------
 
@@ -63,6 +78,10 @@ app.get('/health', (req, res) => {
     meeting_state: meetingState,
     has_page: !!(page && !page.isClosed()),
     reconnecting,
+    joining,
+    last_join_error: lastJoinError,
+    join_started_at: joinStartedAt,
+    last_join_finished_at: lastJoinFinishedAt,
   });
 });
 
@@ -679,12 +698,40 @@ function stopWatchdog() {
 }
 
 async function recoverIfNeeded() {
-  if (joining || reconnecting) return;
+  if (pastBridgeEnd()) {
+    console.log('[bridge] end time reached — reconnect disabled');
+    meetingState = 'disconnected';
+    stopWatchdog();
+    return;
+  }
+  // A failed navigation can close the page while doJoin is still waiting for
+  // Zoom. Do not let that transient flag permanently disable recovery.
+  if (joining) {
+    const elapsed = joinStartedAt ? Date.now() - joinStartedAt : 0;
+    const pageGone = !page || page.isClosed();
+    if (!pageGone && elapsed < 45000) return;
+    console.log('[bridge] join watchdog recovery:', pageGone ? 'page_gone' : 'join_timeout');
+    joining = false;
+    if (!lastJoinError) lastJoinError = pageGone ? 'Zoom page closed during join' : 'Zoom join timed out';
+  }
+  if (reconnecting) return;
   if (!lastJoin) return;
 
   const prev = meetingState;
   const state = await detectMeetingState(page);
   meetingState = state;
+
+  if (state !== 'unknown') {
+    unknownStreak = 0;
+  } else {
+    unknownStreak += 1;
+    if (unknownStreak < UNKNOWN_STREAK_THRESHOLD) {
+      console.log(
+        `[bridge] unknown state (${unknownStreak}/${UNKNOWN_STREAK_THRESHOLD}) — page may still be loading, holding off`
+      );
+      return;
+    }
+  }
 
   if (state === 'in_meeting' || state === 'waiting') {
     if (prev !== state && (prev === 'preview' || prev === 'disconnected' || prev === 'unknown')) {
@@ -734,6 +781,7 @@ async function recoverIfNeeded() {
   }
 
   if (state === 'disconnected' || state === 'signin' || state === 'unknown') {
+    unknownStreak = 0;
     console.log('[bridge] detected', state, '— full rejoin');
     emit({ type: 'disconnected', reason: state, meeting_state: state });
     reconnecting = true;
@@ -771,6 +819,10 @@ async function fullRejoin(reason) {
 }
 
 async function doJoin(params, { force = false } = {}) {
+  if (pastBridgeEnd()) {
+    meetingState = 'disconnected';
+    throw new Error('webinar end time reached; join disabled');
+  }
   const {
     meeting_id,
     password = '',
@@ -827,6 +879,9 @@ async function doJoin(params, { force = false } = {}) {
   console.log('[bridge] starting background join for meeting', meeting_id || join_url);
   joining = true;
   meetingState = 'joining';
+  joinStartedAt = Date.now();
+  lastJoinFinishedAt = null;
+  lastJoinError = null;
 
   try {
     console.log('[bridge] launching Chrome...');
@@ -967,12 +1022,14 @@ async function doJoin(params, { force = false } = {}) {
     emit({ type: 'joined', meeting_state: meetingState });
   } catch (err) {
     console.error('[bridge] join error:', err.message);
+    lastJoinError = err.message || String(err);
     meetingState = 'disconnected';
     emit({ type: 'disconnected', reason: 'join_error', error: err.message });
     // Keep watchdog trying if we have params
     startWatchdog();
   } finally {
     joining = false;
+    lastJoinFinishedAt = Date.now();
   }
 }
 
