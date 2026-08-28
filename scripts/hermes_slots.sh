@@ -32,7 +32,7 @@ status() {
     bp=""; pp=""; state="-"; py="down"
     [[ -f "$PIDDIR/bridge-${p}.pid" ]] && bp="$(cat "$PIDDIR/bridge-${p}.pid" 2>/dev/null || true)"
     [[ -f "$PIDDIR/python-${p}.pid" ]] && pp="$(cat "$PIDDIR/python-${p}.pid" 2>/dev/null || true)"
-    health="$(curl -s -m 1 "http://127.0.0.1:${p}/health" 2>/dev/null || true)"
+    health="$(curl --noproxy '*' -s -m 1 "http://127.0.0.1:${p}/health" 2>/dev/null || true)"
     if [[ -z "$health" ]]; then
       printf "%-6s %-8s %-14s %-8s b=%s p=%s\n" "$p" "down" "-" "down" "${bp:-—}" "${pp:-—}"
       continue
@@ -95,7 +95,7 @@ start_port() {
     echo "env file not found: $envf"; exit 1
   fi
 
-  if curl -s -m 1 "http://127.0.0.1:${p}/health" >/dev/null 2>&1; then
+  if curl --noproxy '*' -s -m 1 "http://127.0.0.1:${p}/health" >/dev/null 2>&1; then
     echo "Port ${p} already has a bridge. Run: $0 stop ${p}"
     exit 1
   fi
@@ -121,7 +121,7 @@ start_port() {
   )
   bridge_ready=0
   for _ in $(seq 1 10); do
-    if curl -s -m 2 "http://127.0.0.1:${p}/health" >/dev/null; then
+    if curl --noproxy '*' -s -m 2 "http://127.0.0.1:${p}/health" >/dev/null; then
       bridge_ready=1
       break
     fi

@@ -3,6 +3,8 @@ FROM mcr.microsoft.com/playwright:v1.59.1-jammy
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV NO_PROXY=127.0.0.1,localhost
+ENV no_proxy=127.0.0.1,localhost
 
 WORKDIR /app
 
