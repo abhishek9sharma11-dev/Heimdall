@@ -389,6 +389,44 @@ def _read_env_kv(env_path: Path) -> dict[str, str]:
     return out
 
 
+def _rehydrate_worker_sessions() -> None:
+    """Restore runtime worker control state after a VM/container restart."""
+    if os.environ.get("HERMES_WORKER_MODE", "0") != "1":
+        return
+    manifest_path = REPO / "schedules" / "today_sessions.json"
+    try:
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return
+    restored = 0
+    with _worker_sessions_lock:
+        for entry in manifest.get("sessions") or []:
+            if not isinstance(entry, dict) or entry.get("enabled") is False:
+                continue
+            meeting_id = str(entry.get("meeting_id") or "").strip()
+            env_file = str(entry.get("env_file") or "").strip()
+            port = entry.get("port")
+            if not meeting_id or not env_file or not port:
+                continue
+            values = _read_env_kv(REPO / env_file)
+            join_url = values.get("MEETING_JOIN_URL", "").strip()
+            if not join_url:
+                continue
+            _worker_sessions[meeting_id] = {
+                "port": int(port),
+                "env_file": env_file,
+                "join_payload": {
+                    "meeting_id": meeting_id,
+                    "display_name": values.get("BOT_DISPLAY_NAME", "Heimdall AI"),
+                    "webinar_token": values.get("MEETING_WEBINAR_TOKEN", ""),
+                    "join_url": join_url,
+                },
+            }
+            restored += 1
+    if restored:
+        print(f"restored {restored} worker session(s) from runtime manifest", flush=True)
+
+
 def _load_schedule(rel: str) -> dict[str, Any]:
     path = REPO / rel
     if not path.exists():
@@ -1328,7 +1366,11 @@ class Handler(SimpleHTTPRequestHandler):
                 safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", session_key)[:40]
                 try:
                     port = _pick_registration_port(meeting_id or safe_key)
-                    env_filename = f".env.{safe_key}"
+                    # Keep runtime credentials beside the persistent schedule
+                    # manifest so an Oracle VM/container restart can restore
+                    # the worker without a database. End-of-session cleanup
+                    # removes both files.
+                    env_filename = f"schedules/.env.{safe_key}"
                     env_path = REPO / env_filename
                     schedule_file = (
                         str(schedule_path.relative_to(REPO))
@@ -1754,6 +1796,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     _load_dotenv()
+    _rehydrate_worker_sessions()
     threading.Thread(target=_metrics_tracker_loop, name="hermes-metrics", daemon=True).start()
     if os.environ.get("HERMES_WORKER_MODE", "0") == "1":
         threading.Thread(target=_worker_supervisor, name="hermes-worker-supervisor", daemon=True).start()

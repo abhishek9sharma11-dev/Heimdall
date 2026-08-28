@@ -1,0 +1,26 @@
+services:
+  heimdall:
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: Dockerfile.oracle
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env.oracle
+    ports:
+      - "8780:8780"
+    volumes:
+      - heimdall-schedules:/app/schedules
+      - heimdall-runtime:/tmp
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8780/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  heimdall-schedules:
+  heimdall-runtime:
