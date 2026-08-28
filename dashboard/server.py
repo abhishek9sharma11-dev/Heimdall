@@ -50,6 +50,8 @@ _cohorts_lock = threading.Lock()
 _bot_procs_lock = threading.Lock()
 # mapping: session_key -> info dict for either subprocess or docker-launched session
 _bot_procs: dict[str, dict[str, Any]] = {}
+_worker_sessions: dict[str, dict[str, Any]] = {}
+_worker_sessions_lock = threading.Lock()
 _PLAYWRIGHT_PORTS = tuple(range(8765, 8776))
 _zoom_registration_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _ZOOM_REGISTRATION_CACHE_SEC = 300
@@ -443,6 +445,33 @@ def _bridge_health(port: int) -> dict[str, Any]:
             "has_page": False,
             "reconnecting": False,
         }
+
+
+def _worker_supervisor() -> None:
+    """Keep live Render worker bridges connected after the initial join."""
+    while True:
+        try:
+            with _worker_sessions_lock:
+                sessions = list(_worker_sessions.values())
+            for session in sessions:
+                port = int(session["port"])
+                health = _bridge_health(port)
+                if health.get("meeting_state") in {"in_meeting", "waiting", "joining"}:
+                    continue
+                if not health.get("online"):
+                    subprocess.run(
+                        [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), session["env_file"]],
+                        cwd=str(REPO), capture_output=True, text=True, timeout=60,
+                    )
+                join_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/join",
+                    data=json.dumps(session["join_payload"]).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                urllib.request.urlopen(join_req, timeout=10).close()
+        except Exception:
+            pass
+        time.sleep(5)
 
 
 def _session_phase(sched: dict[str, Any], now: datetime) -> str:
@@ -1337,6 +1366,17 @@ class Handler(SimpleHTTPRequestHandler):
                         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
                         encoding="utf-8",
                     )
+                    with _worker_sessions_lock:
+                        _worker_sessions[session_key] = {
+                            "port": port,
+                            "env_file": env_filename,
+                            "join_payload": {
+                                "meeting_id": meeting_id,
+                                "display_name": os.environ.get("BOT_DISPLAY_NAME", "Heimdall AI"),
+                                "webinar_token": token,
+                                "join_url": meeting_join_url,
+                            },
+                        }
 
                     # A registration made while the webinar is already live
                     # should connect immediately; the background watcher still
@@ -1682,6 +1722,8 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     _load_dotenv()
     threading.Thread(target=_metrics_tracker_loop, name="hermes-metrics", daemon=True).start()
+    if os.environ.get("HERMES_WORKER_MODE", "0") == "1":
+        threading.Thread(target=_worker_supervisor, name="hermes-worker-supervisor", daemon=True).start()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Hermes Mission Control → http://{HOST}:{PORT}", flush=True)
     print(
