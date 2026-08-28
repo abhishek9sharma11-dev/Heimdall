@@ -122,6 +122,7 @@ start_port() {
   sleep 1.2
   if ! curl -s -m 2 "http://127.0.0.1:${p}/health" >/dev/null; then
     echo "bridge failed — see /tmp/node-bridge-${p}.log"
+    tail -n 40 "/tmp/node-bridge-${p}.log" 2>/dev/null || true
     exit 1
   fi
   echo "Bridge OK (pid $(cat "$PIDDIR/bridge-${p}.pid"))"
