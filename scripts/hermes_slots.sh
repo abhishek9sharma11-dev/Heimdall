@@ -142,6 +142,12 @@ nohup bash -lc "
   exec '$PYTHON_BIN' -m src.main
 " >>"/tmp/python-${p}.log" 2>&1 &
   echo $! >"$PIDDIR/python-${p}.pid"
+  sleep 1
+  if ! kill -0 "$(cat "$PIDDIR/python-${p}.pid")" 2>/dev/null; then
+    echo "python failed to stay up — see /tmp/python-${p}.log"
+    tail -n 40 "/tmp/python-${p}.log" 2>/dev/null || true
+    exit 1
+  fi
   echo "Python OK (pid $(cat "$PIDDIR/python-${p}.pid")) → /tmp/python-${p}.log"
 }
 
