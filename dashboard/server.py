@@ -1337,7 +1337,19 @@ class Handler(SimpleHTTPRequestHandler):
                     # A registration made while the webinar is already live
                     # should connect immediately; the background watcher still
                     # handles future sessions and retries.
-                    if not _bridge_health(port).get("online"):
+                    current_health = _bridge_health(port)
+                    if (
+                        not current_health.get("online")
+                        or current_health.get("meeting_state") in {"idle", "disconnected", "preview"}
+                    ):
+                        if current_health.get("online"):
+                            subprocess.run(
+                                [str(REPO / "scripts" / "hermes_slots.sh"), "stop", str(port)],
+                                cwd=str(REPO),
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                            )
                         launch = subprocess.run(
                             [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), env_filename],
                             cwd=str(REPO),
