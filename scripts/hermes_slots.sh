@@ -119,8 +119,15 @@ start_port() {
     nohup env BRIDGE_PORT="$p" node index.js >>"/tmp/node-bridge-${p}.log" 2>&1 &
     echo $! >"$PIDDIR/bridge-${p}.pid"
   )
-  sleep 1.2
-  if ! curl -s -m 2 "http://127.0.0.1:${p}/health" >/dev/null; then
+  bridge_ready=0
+  for _ in $(seq 1 10); do
+    if curl -s -m 2 "http://127.0.0.1:${p}/health" >/dev/null; then
+      bridge_ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$bridge_ready" != "1" ]]; then
     echo "bridge failed — see /tmp/node-bridge-${p}.log"
     tail -n 40 "/tmp/node-bridge-${p}.log" 2>/dev/null || true
     exit 1
