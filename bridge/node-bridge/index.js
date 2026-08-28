@@ -1018,6 +1018,13 @@ async function doJoin(params, { force = false } = {}) {
       }
     }
 
+    // Once Zoom confirms the meeting page, release the join guard before the
+    // optional chat setup. That setup can be slow or unavailable for a plain
+    // panelist and must never prevent the reconnect watchdog from running.
+    if (meetingState === 'in_meeting' || meetingState === 'waiting') {
+      joining = false;
+      startWatchdog();
+    }
     await postJoinSetup(page);
     emit({ type: 'joined', meeting_state: meetingState });
   } catch (err) {
