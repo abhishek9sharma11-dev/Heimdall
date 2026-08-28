@@ -456,7 +456,9 @@ def _worker_supervisor() -> None:
             for session in sessions:
                 port = int(session["port"])
                 health = _bridge_health(port)
-                if health.get("meeting_state") in {"in_meeting", "waiting", "joining"}:
+                if health.get("meeting_state") in {"in_meeting", "waiting"}:
+                    continue
+                if health.get("meeting_state") == "joining" and health.get("has_page"):
                     continue
                 if not health.get("online"):
                     subprocess.run(
