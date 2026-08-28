@@ -14,6 +14,7 @@ import io
 import os
 import re
 import threading
+import time
 from datetime import date, datetime, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1370,7 +1371,10 @@ class Handler(SimpleHTTPRequestHandler):
                     # Make the actual Zoom connection independent of the
                     # Python scheduler process. This is the critical path for
                     # a live registration; the scheduler can attach afterward.
-                    if _bridge_health(port).get("online"):
+                    bridge_health = _bridge_health(port)
+                    if not bridge_health.get("online"):
+                        raise RuntimeError("bridge did not become reachable after startup")
+                    if bridge_health.get("meeting_state") not in {"joining", "waiting", "in_meeting"}:
                         join_req = urllib.request.Request(
                             f"http://127.0.0.1:{port}/join",
                             data=json.dumps({
@@ -1385,6 +1389,15 @@ class Handler(SimpleHTTPRequestHandler):
                         with urllib.request.urlopen(join_req, timeout=10) as join_resp:
                             if join_resp.status != 200:
                                 raise RuntimeError(f"bridge /join returned HTTP {join_resp.status}")
+
+                    # /join is asynchronous; wait long enough to distinguish a
+                    # real browser connection from an accepted-but-idle request.
+                    deadline = time.monotonic() + 45
+                    while time.monotonic() < deadline:
+                        bridge_health = _bridge_health(port)
+                        if bridge_health.get("meeting_state") in {"preview", "waiting", "in_meeting"}:
+                            break
+                        time.sleep(1)
                 except Exception as e:
                     return self._json(500, {"ok": False, "error": f"registration failed: {e}"})
                 return self._json(200, {
