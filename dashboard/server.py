@@ -1366,6 +1366,25 @@ class Handler(SimpleHTTPRequestHandler):
                                 "ok": False,
                                 "error": f"worker launch failed: {detail[-1000:]}",
                             })
+
+                    # Make the actual Zoom connection independent of the
+                    # Python scheduler process. This is the critical path for
+                    # a live registration; the scheduler can attach afterward.
+                    if _bridge_health(port).get("online"):
+                        join_req = urllib.request.Request(
+                            f"http://127.0.0.1:{port}/join",
+                            data=json.dumps({
+                                "meeting_id": meeting_id,
+                                "display_name": os.environ.get("BOT_DISPLAY_NAME", "Heimdall AI"),
+                                "webinar_token": token,
+                                "join_url": meeting_join_url,
+                            }).encode(),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(join_req, timeout=10) as join_resp:
+                            if join_resp.status != 200:
+                                raise RuntimeError(f"bridge /join returned HTTP {join_resp.status}")
                 except Exception as e:
                     return self._json(500, {"ok": False, "error": f"registration failed: {e}"})
                 return self._json(200, {
