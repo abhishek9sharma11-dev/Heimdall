@@ -1292,6 +1292,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "WEBINAR_START_AT": webinar_start_at or f"{date.today().isoformat()}T{start_ist}",
                         "WEBINAR_END_AT": webinar_end_at or f"{date.today().isoformat()}T{end_ist}",
                         "WEBINAR_JOIN_LEAD_MINUTES": "30",
+                        # Joining and scheduled chat must work even when the
+                        # optional remote LLM credential is not configured.
+                        "ANSWER_QUESTIONS": os.environ.get("ANSWER_QUESTIONS", "false"),
                     }
                     if payment_link_ids:
                         env_values["PAYMENT_LINK_IDS"] = payment_link_ids
