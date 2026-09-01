@@ -151,11 +151,14 @@ async function clickPreviewJoin(pg) {
 
 async function fillNameAndJoin(pg, displayName, password = '') {
   try {
-    const nameSel =
-      'input[placeholder*="name" i], input[placeholder*="Name" i], #inputname';
-    const name = await pg.$(nameSel);
-    if (name) {
-      await name.fill(displayName);
+    const nameSel = 'input[placeholder*="name" i], #inputname, input[type="text"], input:not([type])';
+    const names = await pg.$$(nameSel);
+    for (const name of names) {
+      if (await name.isVisible().catch(() => false)) {
+        await name.fill(displayName);
+        console.log('[bridge] filled display name');
+        break;
+      }
     }
   } catch {}
   if (password) {
@@ -170,6 +173,18 @@ async function fillNameAndJoin(pg, displayName, password = '') {
     } catch (e) {
       console.log('[bridge] passcode fill skip:', e.message);
     }
+  }
+  // Zoom may keep the preview Join button disabled until the name input's
+  // change event has propagated, especially in headless Chromium.
+  try {
+    await pg.waitForFunction(() => {
+      const b = [...document.querySelectorAll('button')].find(
+        (x) => (x.innerText || '').trim() === 'Join' || x.className.includes('preview-join-button')
+      );
+      return !!b && !b.disabled && !b.classList.contains('zm-btn--disabled');
+    }, { timeout: 10000 });
+  } catch (e) {
+    console.log('[bridge] Join remained disabled:', e.message);
   }
   return clickPreviewJoin(pg);
 }
