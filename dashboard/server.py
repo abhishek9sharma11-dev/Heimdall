@@ -74,51 +74,112 @@ def _ensure_worker_registry_table(conn: Any) -> None:
     """)
 
 
+def _worker_database_url() -> str:
+    """Return only the dedicated worker database URL, never the payments DB."""
+    return (os.environ.get("WORKER_DATABASE_URL") or "").strip()
+
+
+def _worker_database_target(dsn: str) -> str:
+    """Describe a database connection without including its password or query."""
+    try:
+        parsed = urlparse(dsn)
+        host = parsed.hostname or "?"
+        port = parsed.port or 5432
+        database = (parsed.path or "/").lstrip("/") or "?"
+        username = parsed.username or "?"
+        return f"host={host} port={port} database={database} user={username}"
+    except (TypeError, ValueError):
+        return "host=? port=? database=? user=?"
+
+
+def _worker_database_error(exc: Exception) -> str:
+    """Keep diagnostics useful while preventing credentials from reaching logs."""
+    detail = str(exc)
+    dsn = _worker_database_url()
+    if dsn:
+        detail = detail.replace(dsn, "<redacted-worker-database-url>")
+    detail = re.sub(r"postgres(?:ql)?://[^\s,)]+", "<redacted-worker-database-url>", detail)
+    return f"{type(exc).__name__}: {detail[:500]}"
+
+
+def _connect_worker_database(*, row_factory: Any = None) -> Any:
+    """Connect to worker storage with a bounded connection timeout."""
+    dsn = _worker_database_url()
+    if not dsn:
+        return None
+    import psycopg
+
+    kwargs: dict[str, Any] = {"connect_timeout": 8}
+    if row_factory is not None:
+        kwargs["row_factory"] = row_factory
+    conn = psycopg.connect(dsn, **kwargs)
+    print(
+        f"Worker database connection established ({_worker_database_target(dsn)})",
+        flush=True,
+    )
+    return conn
+
+
 def _worker_db_rows() -> list[dict[str, Any]]:
     """Read durable worker registrations from configured Postgres."""
     # Keep worker/session state isolated from the payments database.  In
     # production this must be a separately configured Postgres instance (for
     # example Supabase), rather than the legacy Aurora DATABASE_URL.
-    dsn = (os.environ.get("WORKER_DATABASE_URL") or "").strip()
+    dsn = _worker_database_url()
     if not dsn:
         return []
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
-        with psycopg.connect(dsn, connect_timeout=8, row_factory=dict_row) as conn:
-            _ensure_worker_registry_table(conn)
-            conn.commit()
-            return list(conn.execute(
-                "SELECT meeting_id, port, join_url, webinar_token, display_name, start_at "
-                "FROM hermes_worker_sessions WHERE keep_connected = TRUE"
-            ).fetchall())
-    except Exception as exc:
-        print(f"worker registry read failed: {exc}", flush=True)
-        return []
+    from psycopg.rows import dict_row
+    for attempt in range(1, 3):
+        try:
+            with _connect_worker_database(row_factory=dict_row) as conn:
+                _ensure_worker_registry_table(conn)
+                conn.commit()
+                return list(conn.execute(
+                    "SELECT meeting_id, port, join_url, webinar_token, display_name, start_at "
+                    "FROM hermes_worker_sessions WHERE keep_connected = TRUE"
+                ).fetchall())
+        except Exception as exc:
+            if attempt == 2:
+                print(
+                    f"worker registry read failed after {attempt} attempts: "
+                    f"{_worker_database_error(exc)} ({_worker_database_target(dsn)})",
+                    flush=True,
+                )
+            else:
+                time.sleep(1)
+    return []
 
 
 def _persist_worker_db(meeting_id: str, port: int, payload: dict[str, Any], start_at: str) -> None:
-    dsn = (os.environ.get("WORKER_DATABASE_URL") or "").strip()
+    dsn = _worker_database_url()
     if not dsn:
         return
-    try:
-        import psycopg
-        with psycopg.connect(dsn, connect_timeout=8) as conn:
-            _ensure_worker_registry_table(conn)
-            conn.execute(
-                """INSERT INTO hermes_worker_sessions
-                   (meeting_id, port, join_url, webinar_token, display_name, start_at, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                   ON CONFLICT (meeting_id) DO UPDATE SET
-                   port=EXCLUDED.port, join_url=EXCLUDED.join_url,
-                   webinar_token=EXCLUDED.webinar_token, display_name=EXCLUDED.display_name,
-                   start_at=EXCLUDED.start_at, keep_connected=TRUE, updated_at=NOW()""",
-                (meeting_id, port, payload.get("join_url", ""), payload.get("webinar_token", ""),
-                 payload.get("display_name", "Heimdall AI"), start_at),
-            )
-            conn.commit()
-    except Exception as exc:
-        print(f"worker registry write failed: {exc}", flush=True)
+    for attempt in range(1, 3):
+        try:
+            with _connect_worker_database() as conn:
+                _ensure_worker_registry_table(conn)
+                conn.execute(
+                    """INSERT INTO hermes_worker_sessions
+                       (meeting_id, port, join_url, webinar_token, display_name, start_at, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                       ON CONFLICT (meeting_id) DO UPDATE SET
+                       port=EXCLUDED.port, join_url=EXCLUDED.join_url,
+                       webinar_token=EXCLUDED.webinar_token, display_name=EXCLUDED.display_name,
+                       start_at=EXCLUDED.start_at, keep_connected=TRUE, updated_at=NOW()""",
+                    (meeting_id, port, payload.get("join_url", ""), payload.get("webinar_token", ""),
+                     payload.get("display_name", "Heimdall AI"), start_at),
+                )
+                conn.commit()
+                return
+        except Exception as exc:
+            if attempt == 2:
+                print(
+                    f"worker registry write failed after {attempt} attempts: "
+                    f"{_worker_database_error(exc)} ({_worker_database_target(dsn)})",
+                    flush=True,
+                )
+            else:
+                time.sleep(1)
 
 
 def _pick_playwright_port() -> int:
