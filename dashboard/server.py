@@ -1180,6 +1180,47 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 return self._json(502, {"ok": False, "error": f"worker chat failed: {exc}"})
 
+        if path == "/api/worker/page-state":
+            try:
+                body = self._read_json()
+            except json.JSONDecodeError:
+                return self._json(400, {"ok": False, "error": "invalid JSON"})
+            session_key = str(body.get("session_key") or body.get("meeting_id") or "").strip()
+            with _worker_sessions_lock:
+                session = _worker_sessions.get(session_key)
+            if not session:
+                return self._json(404, {"ok": False, "error": "worker session not found"})
+            code = """
+                const body = document.body;
+                ({
+                  title: document.title,
+                  path: location.pathname,
+                  text: (body && body.innerText || '').slice(0, 3000),
+                  buttons: [...document.querySelectorAll('button')].slice(0, 30).map(b => ({
+                    text: (b.innerText || '').trim(),
+                    aria: b.getAttribute('aria-label') || '',
+                    cls: String(b.className || '').slice(0, 120)
+                  })),
+                  inputs: [...document.querySelectorAll('input,textarea')].map(x => ({
+                    tag: x.tagName, type: x.getAttribute('type') || '',
+                    placeholder: x.getAttribute('placeholder') || '',
+                    aria: x.getAttribute('aria-label') || ''
+                  }))
+                })
+            """
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{int(session['port'])}/eval",
+                    data=json.dumps({"code": code}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    result = json.loads(resp.read().decode() or "{}")
+                return self._json(200, {"ok": True, "result": result.get("result", result)})
+            except Exception as exc:
+                return self._json(502, {"ok": False, "error": f"page state failed: {exc}"})
+
         m = re.fullmatch(r"/api/slots/([A-Za-z0-9_-]+)/payment", path)
         if m:
             slot_id = m.group(1)
