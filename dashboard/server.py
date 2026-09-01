@@ -59,6 +59,65 @@ _ZOOM_REGISTRATION_CACHE_SEC = 300
 _TRACKER_EVAL = r'''var t=(document.body&&document.body.innerText)||'';var a=null;var m=t.match(/Attendees\s*\((\d+)\)/i);if(m)a=parseInt(m[1],10);var p=t.match(/Participants\s*\((\d+)\)/i);return {attendees:a,participants:p?parseInt(p[1],10):null};'''
 
 
+def _ensure_worker_registry_table(conn: Any) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS hermes_worker_sessions (
+            meeting_id TEXT PRIMARY KEY,
+            port INTEGER NOT NULL,
+            join_url TEXT NOT NULL,
+            webinar_token TEXT NOT NULL DEFAULT '',
+            display_name TEXT NOT NULL DEFAULT 'Heimdall AI',
+            start_at TEXT NOT NULL DEFAULT '',
+            keep_connected BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+
+def _worker_db_rows() -> list[dict[str, Any]]:
+    """Read durable worker registrations from configured Postgres."""
+    dsn = (os.environ.get("DATABASE_URL") or "").strip()
+    if not dsn:
+        return []
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        with psycopg.connect(dsn, connect_timeout=8, row_factory=dict_row) as conn:
+            _ensure_worker_registry_table(conn)
+            conn.commit()
+            return list(conn.execute(
+                "SELECT meeting_id, port, join_url, webinar_token, display_name, start_at "
+                "FROM hermes_worker_sessions WHERE keep_connected = TRUE"
+            ).fetchall())
+    except Exception as exc:
+        print(f"worker registry read failed: {exc}", flush=True)
+        return []
+
+
+def _persist_worker_db(meeting_id: str, port: int, payload: dict[str, Any], start_at: str) -> None:
+    dsn = (os.environ.get("DATABASE_URL") or "").strip()
+    if not dsn:
+        return
+    try:
+        import psycopg
+        with psycopg.connect(dsn, connect_timeout=8) as conn:
+            _ensure_worker_registry_table(conn)
+            conn.execute(
+                """INSERT INTO hermes_worker_sessions
+                   (meeting_id, port, join_url, webinar_token, display_name, start_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                   ON CONFLICT (meeting_id) DO UPDATE SET
+                   port=EXCLUDED.port, join_url=EXCLUDED.join_url,
+                   webinar_token=EXCLUDED.webinar_token, display_name=EXCLUDED.display_name,
+                   start_at=EXCLUDED.start_at, keep_connected=TRUE, updated_at=NOW()""",
+                (meeting_id, port, payload.get("join_url", ""), payload.get("webinar_token", ""),
+                 payload.get("display_name", "Heimdall AI"), start_at),
+            )
+            conn.commit()
+    except Exception as exc:
+        print(f"worker registry write failed: {exc}", flush=True)
+
+
 def _pick_playwright_port() -> int:
     """Pick an unused local port for a visible Playwright bridge."""
     import urllib.error
@@ -393,6 +452,36 @@ def _rehydrate_worker_sessions() -> None:
     """Restore runtime worker control state after a VM/container restart."""
     if os.environ.get("HERMES_WORKER_MODE", "0") != "1":
         return
+    # Rebuild runtime files from Postgres first. Render containers can lose the
+    # gitignored schedules/ directory when they restart or move instances.
+    db_rows = _worker_db_rows()
+    with _worker_sessions_lock:
+        for row in db_rows:
+            meeting_id = str(row.get("meeting_id") or "").strip()
+            port = row.get("port")
+            join_url = str(row.get("join_url") or "").strip()
+            if not meeting_id or not port or not join_url:
+                continue
+            env_path = REPO / "schedules" / f".env.{meeting_id}"
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            if not env_path.exists():
+                env_path.write_text("\n".join([
+                    f"MEETING_JOIN_URL={join_url}", f"MEETING_ID={meeting_id}",
+                    f"BRIDGE_PORT={int(port)}", f"BRIDGE_URL=http://127.0.0.1:{int(port)}",
+                    f"MEETING_WEBINAR_TOKEN={row.get('webinar_token') or ''}",
+                    f"WEBINAR_START_AT={row.get('start_at') or ''}",
+                    "KEEP_CONNECTED=true", "ANSWER_QUESTIONS=false", "",
+                ]), encoding="utf-8")
+            _worker_sessions[meeting_id] = {
+                "port": int(port), "env_file": str(env_path),
+                "join_payload": {
+                    "meeting_id": meeting_id,
+                    "display_name": row.get("display_name") or "Heimdall AI",
+                    "webinar_token": row.get("webinar_token") or "",
+                    "join_url": join_url,
+                },
+            }
+
     manifest_path = REPO / "schedules" / "today_sessions.json"
     try:
         manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
@@ -1532,6 +1621,15 @@ class Handler(SimpleHTTPRequestHandler):
                         "\n".join(f"{key}={value}" for key, value in env_values.items()) + "\n",
                         encoding="utf-8",
                     )
+                    join_payload = {
+                        "meeting_id": meeting_id,
+                        "display_name": os.environ.get("BOT_DISPLAY_NAME", "Heimdall AI"),
+                        "webinar_token": token,
+                        "join_url": meeting_join_url,
+                    }
+                    _persist_worker_db(
+                        meeting_id, port, join_payload, env_values["WEBINAR_START_AT"]
+                    )
 
                     manifest_path = REPO / "schedules" / "today_sessions.json"
                     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1582,12 +1680,6 @@ class Handler(SimpleHTTPRequestHandler):
                     # Launch outside the HTTP request lifecycle. Render can
                     # terminate a request while Chrome is starting; the
                     # background launcher and supervisor own startup/retries.
-                    join_payload = {
-                        "meeting_id": meeting_id,
-                        "display_name": os.environ.get("BOT_DISPLAY_NAME", "Heimdall AI"),
-                        "webinar_token": token,
-                        "join_url": meeting_join_url,
-                    }
                     _launch_worker_async(port, env_path, join_payload)
                 except Exception as e:
                     return self._json(500, {"ok": False, "error": f"registration failed: {e}"})
