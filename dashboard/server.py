@@ -427,6 +427,16 @@ def _rehydrate_worker_sessions() -> None:
         print(f"restored {restored} worker session(s) from runtime manifest", flush=True)
 
 
+def _ensure_worker_sessions_loaded() -> None:
+    """Recover worker control state if the web process was restarted."""
+    if os.environ.get("HERMES_WORKER_MODE", "0") != "1":
+        return
+    with _worker_sessions_lock:
+        loaded = bool(_worker_sessions)
+    if not loaded:
+        _rehydrate_worker_sessions()
+
+
 def _load_schedule(rel: str) -> dict[str, Any]:
     path = REPO / rel
     if not path.exists():
@@ -1020,6 +1030,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path == "/api/worker/health":
             # Safe diagnostics only: never return the join URL or webinar token.
+            _ensure_worker_sessions_loaded()
             with _worker_sessions_lock:
                 sessions = list(_worker_sessions.items())
             workers = []
@@ -1155,6 +1166,7 @@ class Handler(SimpleHTTPRequestHandler):
         path = parsed.path
 
         if path == "/api/worker/chat":
+            _ensure_worker_sessions_loaded()
             try:
                 body = self._read_json()
             except json.JSONDecodeError:
@@ -1181,6 +1193,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(502, {"ok": False, "error": f"worker chat failed: {exc}"})
 
         if path == "/api/worker/page-state":
+            _ensure_worker_sessions_loaded()
             try:
                 body = self._read_json()
             except json.JSONDecodeError:

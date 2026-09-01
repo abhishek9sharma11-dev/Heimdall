@@ -100,7 +100,9 @@ def _valid_session(entry: object) -> dict:
         raise ValueError("missing schedule_file")
     int(entry.get("port"))
     normalize_session_time(entry.get("session_start_ist"), allow_empty=False)
-    normalize_session_time(entry.get("session_end_ist"), allow_empty=False)
+    # Persistent worker registrations intentionally have no end time.
+    if not entry.get("keep_connected"):
+        normalize_session_time(entry.get("session_end_ist"), allow_empty=False)
     return entry
 
 
@@ -597,7 +599,12 @@ def main() -> None:
             lead = int(s.get("start_lead_minutes") or 30)
             peak_mins = int(s.get("peak_window_minutes") or 60)
             start_dt = parse_hhmmss(s["session_start_ist"])
-            end_dt = parse_hhmmss(s["session_end_ist"])
+            persistent = bool(s.get("keep_connected")) or not s.get("session_end_ist")
+            end_dt = (
+                parse_hhmmss(s["session_end_ist"])
+                if not persistent
+                else n + timedelta(days=36500)
+            )
             auto_at = start_dt - timedelta(minutes=lead)
             peak_until = start_dt + timedelta(minutes=peak_mins)
 
