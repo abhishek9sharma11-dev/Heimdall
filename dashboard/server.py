@@ -1192,7 +1192,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(404, {"ok": False, "error": "worker session not found"})
             code = """
                 const body = document.body;
-                ({
+                return ({
                   title: document.title,
                   path: location.pathname,
                   text: (body && body.innerText || '').slice(0, 3000),
