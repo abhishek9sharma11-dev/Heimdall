@@ -540,6 +540,39 @@ def _worker_supervisor() -> None:
         time.sleep(5)
 
 
+def _launch_worker_async(port: int, env_path: Path, join_payload: dict[str, Any]) -> None:
+    """Start a worker outside the Render HTTP request lifecycle."""
+    def launch() -> None:
+        try:
+            current = _bridge_health(port)
+            if current.get("online") and current.get("meeting_state") in {"idle", "disconnected", "preview"}:
+                subprocess.run(
+                    [str(REPO / "scripts" / "hermes_slots.sh"), "stop", str(port)],
+                    cwd=str(REPO), capture_output=True, text=True, timeout=30,
+                )
+            if not _bridge_health(port).get("online"):
+                result = subprocess.run(
+                    [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), str(env_path)],
+                    cwd=str(REPO), capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    detail = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+                    print(f"worker launch failed: {detail[-1000:]}", flush=True)
+                    return
+            health = _bridge_health(port)
+            if health.get("meeting_state") not in {"joining", "waiting", "in_meeting"}:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/join",
+                    data=json.dumps(join_payload).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                urllib.request.urlopen(req, timeout=10).close()
+        except Exception as exc:
+            print(f"worker async launch failed: {exc}", flush=True)
+
+    threading.Thread(target=launch, name=f"worker-launch-{port}", daemon=True).start()
+
+
 def _session_phase(sched: dict[str, Any], now: datetime) -> str:
     start = sched.get("session_start_ist")
     end = sched.get("session_end_ist")
@@ -1546,63 +1579,16 @@ class Handler(SimpleHTTPRequestHandler):
                             },
                         }
 
-                    # A registration made while the webinar is already live
-                    # should connect immediately; the background watcher still
-                    # handles future sessions and retries.
-                    current_health = _bridge_health(port)
-                    if (
-                        not current_health.get("online")
-                        or current_health.get("meeting_state") in {"idle", "disconnected", "preview"}
-                    ):
-                        if current_health.get("online"):
-                            subprocess.run(
-                                [str(REPO / "scripts" / "hermes_slots.sh"), "stop", str(port)],
-                                cwd=str(REPO),
-                                capture_output=True,
-                                text=True,
-                                timeout=30,
-                            )
-                        launch = subprocess.run(
-                            [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), str(env_path)],
-                            cwd=str(REPO),
-                            capture_output=True,
-                            text=True,
-                            timeout=45,
-                        )
-                        if launch.returncode != 0:
-                            detail = ((launch.stdout or "") + "\n" + (launch.stderr or "")).strip()
-                            return self._json(500, {
-                                "ok": False,
-                                "error": f"worker launch failed: {detail[-1000:]}",
-                            })
-
-                    # Make the actual Zoom connection independent of the
-                    # Python scheduler process. This is the critical path for
-                    # a live registration; the scheduler can attach afterward.
-                    bridge_health = _bridge_health(port)
-                    if not bridge_health.get("online"):
-                        raise RuntimeError("bridge did not become reachable after startup")
-                    if bridge_health.get("meeting_state") not in {"joining", "waiting", "in_meeting"}:
-                        join_req = urllib.request.Request(
-                            f"http://127.0.0.1:{port}/join",
-                            data=json.dumps({
-                                "meeting_id": meeting_id,
-                                "display_name": os.environ.get("BOT_DISPLAY_NAME", "Heimdall AI"),
-                                "webinar_token": token,
-                                "join_url": meeting_join_url,
-                            }).encode(),
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(join_req, timeout=10) as join_resp:
-                            if join_resp.status != 200:
-                                raise RuntimeError(f"bridge /join returned HTTP {join_resp.status}")
-
-                    # /join is asynchronous. Do not wait for the browser to
-                    # finish joining here: Render's HTTP proxy can time out
-                    # long requests and kill the registration before the
-                    # supervisor gets a chance to maintain the worker. The
-                    # worker supervisor owns retries and join completion.
+                    # Launch outside the HTTP request lifecycle. Render can
+                    # terminate a request while Chrome is starting; the
+                    # background launcher and supervisor own startup/retries.
+                    join_payload = {
+                        "meeting_id": meeting_id,
+                        "display_name": os.environ.get("BOT_DISPLAY_NAME", "Heimdall AI"),
+                        "webinar_token": token,
+                        "join_url": meeting_join_url,
+                    }
+                    _launch_worker_async(port, env_path, join_payload)
                 except Exception as e:
                     return self._json(500, {"ok": False, "error": f"registration failed: {e}"})
                 return self._json(200, {
