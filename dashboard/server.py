@@ -1154,6 +1154,32 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if path == "/api/worker/chat":
+            try:
+                body = self._read_json()
+            except json.JSONDecodeError:
+                return self._json(400, {"ok": False, "error": "invalid JSON"})
+            session_key = str(body.get("session_key") or body.get("meeting_id") or "").strip()
+            text = str(body.get("text") or "").strip()
+            if not session_key or not text:
+                return self._json(400, {"ok": False, "error": "session_key and text are required"})
+            with _worker_sessions_lock:
+                session = _worker_sessions.get(session_key)
+            if not session:
+                return self._json(404, {"ok": False, "error": "worker session not found"})
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{int(session['port'])}/send_chat",
+                    data=json.dumps({"text": text, "to": "everyone", "submit": True}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode() or "{}")
+                return self._json(200, {"ok": True, "session_key": session_key, "result": result})
+            except Exception as exc:
+                return self._json(502, {"ok": False, "error": f"worker chat failed: {exc}"})
+
         m = re.fullmatch(r"/api/slots/([A-Za-z0-9_-]+)/payment", path)
         if m:
             slot_id = m.group(1)
