@@ -1372,6 +1372,11 @@ class Handler(SimpleHTTPRequestHandler):
                     # removes both files.
                     env_filename = f"schedules/.env.{safe_key}"
                     env_path = REPO / env_filename
+                    # Render does not ship the gitignored schedules/ directory
+                    # on a fresh deploy. Create it before writing runtime
+                    # worker credentials; otherwise registration can appear to
+                    # succeed and the launcher immediately cannot find the env.
+                    env_path.parent.mkdir(parents=True, exist_ok=True)
                     schedule_file = (
                         str(schedule_path.relative_to(REPO))
                         if schedule_path
@@ -1384,8 +1389,13 @@ class Handler(SimpleHTTPRequestHandler):
                         schedule_doc = _load_schedule(schedule_file)
                         start_ist = start_ist or str(schedule_doc.get("session_start_ist") or "")
                         end_ist = end_ist or str(schedule_doc.get("session_end_ist") or "")
-                    if not start_ist or not end_ist:
-                        return self._json(400, {"ok": False, "error": "webinar start and end times required"})
+                    # A worker with no end time is intentionally persistent:
+                    # src.main and the bridge watchdog keep it connected until
+                    # the worker is explicitly stopped. This is useful for a
+                    # live session whose end time is unknown.
+                    if not start_ist:
+                        start_ist = datetime.now(TZ).strftime("%H:%M:%S")
+                    keep_connected = not bool(end_ist)
 
                     env_values = {
                         "MEETING_JOIN_URL": meeting_join_url,
@@ -1395,12 +1405,14 @@ class Handler(SimpleHTTPRequestHandler):
                         "MEETING_WEBINAR_TOKEN": token,
                         "SCHEDULE_FILE": schedule_file,
                         "WEBINAR_START_AT": webinar_start_at or f"{date.today().isoformat()}T{start_ist}",
-                        "WEBINAR_END_AT": webinar_end_at or f"{date.today().isoformat()}T{end_ist}",
                         "WEBINAR_JOIN_LEAD_MINUTES": "30",
+                        "KEEP_CONNECTED": "true" if keep_connected else "false",
                         # Joining and scheduled chat must work even when the
                         # optional remote LLM credential is not configured.
                         "ANSWER_QUESTIONS": os.environ.get("ANSWER_QUESTIONS", "false"),
                     }
+                    if end_ist:
+                        env_values["WEBINAR_END_AT"] = webinar_end_at or f"{date.today().isoformat()}T{end_ist}"
                     if payment_link_ids:
                         env_values["PAYMENT_LINK_IDS"] = payment_link_ids
                     env_path.write_text(
@@ -1428,6 +1440,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "schedule_file": schedule_file,
                         "session_start_ist": start_ist,
                         "session_end_ist": end_ist,
+                        "keep_connected": keep_connected,
                         "join_url_present": bool(meeting_join_url),
                         "enabled": True,
                         "peak_window_minutes": 60,
@@ -1470,7 +1483,7 @@ class Handler(SimpleHTTPRequestHandler):
                                 timeout=30,
                             )
                         launch = subprocess.run(
-                            [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), env_filename],
+                            [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), str(env_path)],
                             cwd=str(REPO),
                             capture_output=True,
                             text=True,
