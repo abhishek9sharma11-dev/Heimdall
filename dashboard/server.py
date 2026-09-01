@@ -1598,14 +1598,11 @@ class Handler(SimpleHTTPRequestHandler):
                             if join_resp.status != 200:
                                 raise RuntimeError(f"bridge /join returned HTTP {join_resp.status}")
 
-                    # /join is asynchronous; wait long enough to distinguish a
-                    # real browser connection from an accepted-but-idle request.
-                    deadline = time.monotonic() + 45
-                    while time.monotonic() < deadline:
-                        bridge_health = _bridge_health(port)
-                        if bridge_health.get("meeting_state") in {"preview", "waiting", "in_meeting"}:
-                            break
-                        time.sleep(1)
+                    # /join is asynchronous. Do not wait for the browser to
+                    # finish joining here: Render's HTTP proxy can time out
+                    # long requests and kill the registration before the
+                    # supervisor gets a chance to maintain the worker. The
+                    # worker supervisor owns retries and join completion.
                 except Exception as e:
                     return self._json(500, {"ok": False, "error": f"registration failed: {e}"})
                 return self._json(200, {
