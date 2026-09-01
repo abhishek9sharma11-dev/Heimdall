@@ -76,7 +76,10 @@ def _ensure_worker_registry_table(conn: Any) -> None:
 
 def _worker_db_rows() -> list[dict[str, Any]]:
     """Read durable worker registrations from configured Postgres."""
-    dsn = (os.environ.get("DATABASE_URL") or "").strip()
+    # Keep worker/session state isolated from the payments database.  In
+    # production this must be a separately configured Postgres instance (for
+    # example Supabase), rather than the legacy Aurora DATABASE_URL.
+    dsn = (os.environ.get("WORKER_DATABASE_URL") or "").strip()
     if not dsn:
         return []
     try:
@@ -95,7 +98,7 @@ def _worker_db_rows() -> list[dict[str, Any]]:
 
 
 def _persist_worker_db(meeting_id: str, port: int, payload: dict[str, Any], start_at: str) -> None:
-    dsn = (os.environ.get("DATABASE_URL") or "").strip()
+    dsn = (os.environ.get("WORKER_DATABASE_URL") or "").strip()
     if not dsn:
         return
     try:
