@@ -1046,7 +1046,13 @@ async function doJoin(params, { force = false } = {}) {
       joining = false;
       startWatchdog();
     }
-    await postJoinSetup(page);
+    // A webinar can legitimately remain on "Joining Webinar..." until the
+    // host starts/admit the session. There is no chat UI yet, so do not run
+    // chat setup while waiting; doing so keeps the join lifecycle blocked and
+    // makes the supervisor recycle a valid waiting page.
+    if (meetingState === 'in_meeting') {
+      await postJoinSetup(page);
+    }
     emit({ type: 'joined', meeting_state: meetingState });
   } catch (err) {
     console.error('[bridge] join error:', err.message);
