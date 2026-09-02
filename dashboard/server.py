@@ -725,6 +725,18 @@ def _launch_worker_async(port: int, env_path: Path, join_payload: dict[str, Any]
     def launch() -> None:
         try:
             current = _bridge_health(port)
+            if current.get("joining") and current.get("join_started_at"):
+                age_ms = int(time.time() * 1000) - int(current["join_started_at"])
+                if age_ms > 45_000:
+                    print(
+                        f"worker join stale on port {port}; restarting bridge",
+                        flush=True,
+                    )
+                    subprocess.run(
+                        [str(REPO / "scripts" / "hermes_slots.sh"), "stop", str(port)],
+                        cwd=str(REPO), capture_output=True, text=True, timeout=30,
+                    )
+                    current = _bridge_health(port)
             if current.get("online") and current.get("meeting_state") in {"idle", "disconnected", "preview"}:
                 subprocess.run(
                     [str(REPO / "scripts" / "hermes_slots.sh"), "stop", str(port)],
