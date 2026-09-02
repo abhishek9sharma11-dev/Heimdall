@@ -94,7 +94,13 @@ async function detectMeetingState(pg) {
       const text = (document.body && document.body.innerText) || '';
       const href = location.href || '';
       if (/sign.?in|login/i.test(href)) return 'signin';
-      if (/Waiting for host/i.test(text)) return 'waiting';
+      // Webinar panelists can sit on this page before the webinar is live.
+      // Treat it as a stable waiting state; classifying it as "unknown" keeps
+      // the join guard alive and causes the watchdog to destroy/restart a
+      // perfectly valid Zoom page every 45 seconds.
+      if (/Waiting for host|Joining Webinar|waiting to be admitted/i.test(text)) {
+        return 'waiting';
+      }
       const joinBtn = [...document.querySelectorAll('button')].find((b) => {
         const t = (b.innerText || '').trim();
         const c = String(b.className || '');
