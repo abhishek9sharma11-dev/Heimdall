@@ -53,6 +53,7 @@ _bot_procs: dict[str, dict[str, Any]] = {}
 _worker_sessions: dict[str, dict[str, Any]] = {}
 _worker_sessions_lock = threading.Lock()
 _worker_supervisor_error: str | None = None
+_worker_starting_ports: set[int] = set()
 _PLAYWRIGHT_PORTS = tuple(range(8765, 8776))
 _zoom_registration_cache: dict[str, tuple[float, int | None, str | None]] = {}
 _ZOOM_REGISTRATION_CACHE_SEC = 300
@@ -118,6 +119,32 @@ def _connect_worker_database(*, row_factory: Any = None) -> Any:
         flush=True,
     )
     return conn
+
+
+def _start_worker_slot(port: int, env_file: str) -> bool:
+    """Start a slot detached from the HTTP/supervisor request lifecycle."""
+    with _worker_sessions_lock:
+        if port in _worker_starting_ports:
+            return False
+        _worker_starting_ports.add(port)
+    try:
+        subprocess.Popen(
+            [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), env_file],
+            cwd=str(REPO), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        def release_when_done() -> None:
+            # The shell script owns its own logs; this only releases the guard.
+            time.sleep(15)
+            with _worker_sessions_lock:
+                _worker_starting_ports.discard(port)
+        threading.Thread(target=release_when_done, daemon=True).start()
+        return True
+    except Exception:
+        with _worker_sessions_lock:
+            _worker_starting_ports.discard(port)
+        raise
 
 
 def _worker_db_rows() -> list[dict[str, Any]]:
@@ -671,12 +698,12 @@ def _worker_supervisor() -> None:
                     if health.get("meeting_state") == "joining" and health.get("has_page"):
                         continue
                     if not health.get("online"):
-                        launch = subprocess.run(
-                            [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), session["env_file"]],
-                            cwd=str(REPO), capture_output=True, text=True, timeout=60,
-                        )
-                        if launch.returncode != 0:
-                            raise RuntimeError((launch.stderr or launch.stdout or "bridge start failed")[-500:])
+                        _start_worker_slot(port, session["env_file"])
+                        # The slot script starts both bridge and Python in the
+                        # background. Do not hold the supervisor hostage while
+                        # Render/Chrome boots; the next tick will verify health.
+                        _worker_supervisor_error = None
+                        continue
                     join_req = urllib.request.Request(
                         f"http://127.0.0.1:{port}/join",
                         data=json.dumps(session["join_payload"]).encode(),
@@ -704,14 +731,9 @@ def _launch_worker_async(port: int, env_path: Path, join_payload: dict[str, Any]
                     cwd=str(REPO), capture_output=True, text=True, timeout=30,
                 )
             if not _bridge_health(port).get("online"):
-                result = subprocess.run(
-                    [str(REPO / "scripts" / "hermes_slots.sh"), "start", str(port), str(env_path)],
-                    cwd=str(REPO), capture_output=True, text=True, timeout=60,
-                )
-                if result.returncode != 0:
-                    detail = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
-                    print(f"worker launch failed: {detail[-1000:]}", flush=True)
-                    return
+                _start_worker_slot(port, str(env_path))
+                # Bridge readiness is checked below and by the supervisor.
+                # Render must not tie the HTTP request to Chrome startup.
             health = _bridge_health(port)
             if health.get("meeting_state") not in {"joining", "waiting", "in_meeting"}:
                 req = urllib.request.Request(
