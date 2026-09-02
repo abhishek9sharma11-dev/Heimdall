@@ -1400,10 +1400,15 @@ class Handler(SimpleHTTPRequestHandler):
                     aria: b.getAttribute('aria-label') || '',
                     cls: String(b.className || '').slice(0, 120)
                   })),
-                  inputs: [...document.querySelectorAll('input,textarea')].map(x => ({
+                  inputs: [...document.querySelectorAll('input,textarea,[contenteditable="true"]')].map(x => ({
                     tag: x.tagName, type: x.getAttribute('type') || '',
+                    id: x.id || '', name: x.getAttribute('name') || '',
                     placeholder: x.getAttribute('placeholder') || '',
-                    aria: x.getAttribute('aria-label') || ''
+                    aria: x.getAttribute('aria-label') || '',
+                    cls: String(x.className || '').slice(0, 120),
+                    visible: !!(x.offsetWidth || x.offsetHeight || x.getClientRects().length),
+                    disabled: !!x.disabled,
+                    value_length: String(x.value || '').length
                   }))
                 })
             """
