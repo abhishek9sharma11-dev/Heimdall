@@ -116,7 +116,11 @@ start_port() {
     else
       unset PLAYWRIGHT_BROWSERS_PATH
     fi
-    nohup env BRIDGE_PORT="$p" node index.js >>"/tmp/node-bridge-${p}.log" 2>&1 &
+    if [[ "${HERMES_WORKER_MODE:-0}" == "1" && "${ZOOM_HEADLESS:-0}" != "1" ]] && command -v xvfb-run >/dev/null 2>&1; then
+      nohup env BRIDGE_PORT="$p" xvfb-run -a --server-args="-screen 0 1440x900x24" node index.js >>"/tmp/node-bridge-${p}.log" 2>&1 &
+    else
+      nohup env BRIDGE_PORT="$p" node index.js >>"/tmp/node-bridge-${p}.log" 2>&1 &
+    fi
     echo $! >"$PIDDIR/bridge-${p}.pid"
   )
   bridge_ready=0

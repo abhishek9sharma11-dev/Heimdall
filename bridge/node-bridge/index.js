@@ -1638,7 +1638,9 @@ app.post('/eval', async (req, res) => {
 // ---- Start --------------------------------------------------------------
 
 const PORT = parseInt(process.env.BRIDGE_PORT || '8765');
-const HEADLESS = process.env.HERMES_WORKER_MODE === '1' || process.env.ZOOM_HEADLESS === '1';
+// Render runs Chrome inside Xvfb so Zoom sees the same headed browser path as
+// local runs. Set ZOOM_HEADLESS=1 only for environments without a display.
+const HEADLESS = process.env.ZOOM_HEADLESS === '1';
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`[node-bridge] listening on 127.0.0.1:${PORT}`);
 });
